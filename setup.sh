@@ -14,7 +14,7 @@ ADDMOBILEPORTAL_IMAGE="${SERVICE2_IMAGE:-registry.mobile-developer.com/add-mobil
 NGINX_IMAGE="${NGINX_IMAGE:-docker.io/library/nginx:alpine}"
 
 # ---- Ports (host-published ports on the pod) -------------------------------
-HTTP_PORT="${HTTP_PORT:-80}"          # nginx entrypoint
+HTTP_PORT="${HTTP_PORT:-4001}"          # nginx entrypoint
 KAFKA_PORT="${KAFKA_PORT:-9092}"
 MONGO_PORT="${MONGO_PORT:-27017}"
 MOBILESERVICES_PORT="${MOBILESERVICES_PORT:-8081}"
@@ -132,7 +132,7 @@ events {}
 
 http {
     server {
-        listen 80;
+        listen ${HTTP_PORT};
 
         location / {
             proxy_pass         http://127.0.0.1:${ADDMOBILEPORTAL_PORT};
