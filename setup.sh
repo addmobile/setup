@@ -52,6 +52,17 @@ else
   exit 1
 fi
 
+read -p "Enter ADD-Gateway URL: " AUTH_URL
+
+STATUS_CODE=$(curl -s -o /dev/null -w "%{http_code}" "${AUTH_URL}")
+
+if [ "$STATUS_CODE" -eq 200 ]; then
+    echo "✅ Success: {AUTH_URL} returned HTTP 200"
+else
+    echo "❌ Failed: {AUTH_URL} returned HTTP $STATUS_CODE"
+    exit 1
+fi
+
 mkdir -p "${CONF_DIR}" "${DATA_DIR}/mongo" "${DATA_DIR}/kafka"
 
 # ---- 1. Create the pod ------------------------------------------------------
@@ -111,8 +122,6 @@ podman run -d \
   --pod "${POD_NAME}" \
   --name mobileservices \
   -e PORT="${MOBILESERVICES_PORT}" \
-  -e MONGO_URL="mongodb://127.0.0.1:${MONGO_PORT}" \
-  -e KAFKA_BROKER="127.0.0.1:${KAFKA_PORT}" \
   "${MOBILESERVICES_IMAGE}"
 
 # ---- 5. service2 --------------------------------------------------------------
@@ -135,11 +144,16 @@ http {
         listen ${HTTP_PORT};
 
         location / {
+            auth_request        http://127.0.0.1:${MOBILESERVICES_PORT};
             proxy_pass         http://127.0.0.1:${ADDMOBILEPORTAL_PORT};
             proxy_set_header    Host \$host;
             proxy_set_header    X-Real-IP \$remote_addr;
             proxy_set_header    X-Forwarded-For \$proxy_add_x_forwarded_for;
             proxy_set_header    X-Forwarded-Proto \$scheme;
+        }
+
+        location /auth/ping {
+          proxy_pass http://127.0.01.:${MOBILESERVICES_PORT}/auth/ping; 
         }
     }
 }
