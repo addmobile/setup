@@ -52,8 +52,6 @@ else
   exit 1
 fi
 
-unset PASSWORD
-
 mkdir -p "${CONF_DIR}" "${DATA_DIR}/mongo" "${DATA_DIR}/kafka"
 
 # ---- 1. Create the pod ------------------------------------------------------
@@ -157,3 +155,5 @@ podman run -d \
 echo ">> All containers started. Pod status:"
 podman pod ps
 podman ps --pod
+
+unset PASSWORD
