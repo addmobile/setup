@@ -4,6 +4,8 @@ set -euo pipefail
 
 POD_NAME="mobile-pod"
 
+REGISTRY="https://registry.mobile-developer.com"
+
 # ---- Images (override via env vars if you have your own) -----------------
 KAFKA_IMAGE="${KAFKA_IMAGE:-docker.io/apache/kafka:4.3.1}"
 MONGO_IMAGE="${MONGO_IMAGE:-docker.io/library/mongo:8.2.3-noble}"
@@ -36,6 +38,21 @@ fi
 
 # Clean up any previous run so this script is idempotent
 teardown
+
+read -p "Username: " USERNAME
+read -s -p "Password: " PASSWORD
+echo
+
+# Pass the password via stdin so it never appears in process listings
+# (e.g. `ps aux`) or shell history.
+if printf '%s' "${PASSWORD}" | podman login "${REGISTRY}" --username "${USERNAME}" --password-stdin; then
+  echo ">> Successfully logged in to ${REGISTRY} as ${USERNAME}."
+else
+  echo ">> Login to ${REGISTRY} failed." >&2
+  exit 1
+fi
+
+unset PASSWORD
 
 mkdir -p "${CONF_DIR}" "${DATA_DIR}/mongo" "${DATA_DIR}/kafka"
 
@@ -82,7 +99,7 @@ podman run -d \
   --name mongodb \
   --restart always \
   --memory 768m --memory-swap 768m \
-  --volume "${DATA_DIR}:/data/db:Z" \
+  --volume "${DATA_DIR}/mongo:/data/db:Z" \
   --volume mongo-configdb:/data/configdb \
   --bind_ip_all \
   --quiet \
