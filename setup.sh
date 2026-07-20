@@ -99,11 +99,11 @@ podman run -d \
   --memory 768m --memory-swap 768m \
   --volume "${DATA_DIR}/mongo:/data/db:Z" \
   --volume mongo-configdb:/data/configdb \
+  "${MONGO_IMAGE}"
   --bind_ip_all \
   --quiet \
   --wiredTigerCacheSizeGB 0.25 \
   --setParameter diagnosticDataCollectionEnabled=false
-  "${MONGO_IMAGE}"
 
 # ---- 4. service1 --------------------------------------------------------------
 echo ">> Starting mobileservices..."
