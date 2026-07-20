@@ -113,7 +113,7 @@ podman run -d \
   -e PORT="${MOBILESERVICES_PORT}" \
   -e MONGO_URL="mongodb://127.0.0.1:${MONGO_PORT}" \
   -e KAFKA_BROKER="127.0.0.1:${KAFKA_PORT}" \
-  "${$MOBILESERVICES_IMAGE}"
+  "${MOBILESERVICES_IMAGE}"
 
 # ---- 5. service2 --------------------------------------------------------------
 echo ">> Starting service2..."
@@ -123,7 +123,7 @@ podman run -d \
   -e PORT="${ADDMOBILEPORTAL_PORT}" \
   -e MONGO_URL="mongodb://127.0.0.1:${MONGO_PORT}" \
   -e KAFKA_BROKER="127.0.0.1:${KAFKA_PORT}" \
-  "${$ADDMOBILEPORTAL_IMAGE}"
+  "${ADDMOBILEPORTAL_IMAGE}"
 
 # ---- 6. NGINX reverse proxy -> service2 --------------------------------------
 echo ">> Writing nginx config..."
