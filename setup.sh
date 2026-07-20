@@ -39,8 +39,8 @@ fi
 # Clean up any previous run so this script is idempotent
 teardown
 
-read -p "Username: " USERNAME
-read -s -p "Password: " PASSWORD
+read -r -p "Username: " USERNAME < /dev/tty
+read -r -s -p "Password: " PASSWORD < /dev/tty
 echo
 
 # Pass the password via stdin so it never appears in process listings
