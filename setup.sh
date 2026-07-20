@@ -119,7 +119,7 @@ podman run -d \
 echo ">> Starting service2..."
 podman run -d \
   --pod "${POD_NAME}" \
-  --name mobileservices \
+  --name add-mobileportal \
   -e PORT="${ADDMOBILEPORTAL_PORT}" \
   -e MONGO_URL="mongodb://127.0.0.1:${MONGO_PORT}" \
   -e KAFKA_BROKER="127.0.0.1:${KAFKA_PORT}" \
