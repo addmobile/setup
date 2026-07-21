@@ -16,7 +16,7 @@ NGINX_IMAGE="${NGINX_IMAGE:-docker.io/library/nginx:alpine}"
 # ---- Ports (host-published ports on the pod) -------------------------------
 KAFKA_PORT="${KAFKA_PORT:-9092}"
 MONGO_PORT="${MONGO_PORT:-27017}"
-MOBILEAPI_PORT="${MOBILEAPI_PORT:-8080}" # nginx entrypoint
+MOBILEAPI_PORT="" # nginx entrypoint default is 8080 set on the prompt below
 MOBILESERVICES_PORT="${MOBILESERVICES_PORT:-8081}"
 ADDMOBILEPORTAL_PORT="${SERVICE2_PORT:-8082}"
 
@@ -85,11 +85,13 @@ else
   exit 1
 fi
 
-if [ -z "${MOBILEAPI_PORT}" ]; then;
-  echo -e "${ICON_TIP} ${BLUE} Tip: Set the environment variable MOBILEAPI_PORT during login ${GREEN}(e.g. ~/.bashrc, ~/.cshrc, ~/.zshrc)${BLUE} so you don't have to enter it here.${NC}"
+if [ -z "${MOBILEAPI_PORT}" ]; then
+  echo -e "${ICON_TIP} ${BLUE} \nTip: Set the environment variable MOBILEAPI_PORT during login ${GREEN}(e.g. ~/.bashrc, ~/.cshrc, ~/.zshrc)${BLUE} so you don't have to enter it here.${NC}"
+  echo ""
   read -p "PORT (default: 8080): " MOBILEAPI_PORT
   MOBILEAPI_PORT="${MOBILEAPI_PORT:-8080}"
-  echo "PORT: ${MOBILEAPI_PORT}"
+  echo -e "${BLUE}PORT: ${MOBILEAPI_PORT}${NC}"
+  echo ""
 fi 
 
 if [ -z "${GATEWAY_URL}" ]; then
