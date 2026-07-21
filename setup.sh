@@ -121,9 +121,7 @@ echo ""
 echo -e "${YELLOW}>> Creating pod '${POD_NAME}'..."
 podman pod create \
   --name "${POD_NAME}" \
-  -p "${MOBILEAPI_PORT}:80" \
-  -p "${MOBILESERVICES_PORT}:${MOBILESERVICES_PORT}"
-
+  -p "${MOBILEAPI_PORT}:80"
 
 if command -v getenforce >/dev/null 2>&1 && [ "$(getenforce)" != "Disabled" ]; then
       VOLUME_SUFFIX=":Z"
