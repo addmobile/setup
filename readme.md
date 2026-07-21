@@ -4,12 +4,12 @@
 
 ### Optional: Set environment variable
 
-~/.bashrc
+`~/.bashrc`
 ```
 GATEWAY_URL=<your gateway url>
 ```
 
-### Run the following in bash
+Run the following in bash
 ```
 $ bash -c "$(curl -fsSL https://raw.githubusercontent.com/addmobile/setup/refs/heads/main/setup.sh)"
 ```
