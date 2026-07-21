@@ -1,5 +1,7 @@
 # ADDMOBILE Server Setup Script
 
+![ADDMOBILE_IMAGE](add_mobile.png)
+
 ## Installation 
 
 Optional: Set environment variable
