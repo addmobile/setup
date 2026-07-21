@@ -16,7 +16,7 @@ $ bash -c "$(curl -fsSL https://raw.githubusercontent.com/addmobile/setup/refs/h
 
 ## Uninstall
 
-This will stop and remove the pod
+This will stop and remove mobile-pod
 ```
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/addmobile/setup/refs/heads/main/clear.sh)"
 ```
