@@ -26,11 +26,41 @@ CONF_DIR="${BASE_DIR}/conf"
 DATA_DIR="${BASE_DIR}/data"
 KAFKA_DIR="${DATA_DIR}/kafka"
 MONGODB_DIR="${DATA_DIR}/mongo"
+GATEWAY_URL="${GATEWAY_URL:-}"
+
+# ---- Icons ------------------------
+ICON_THUMBSUP="👍"
+ICON_THUMBSDOWN="👎"
+ICON_WARN="⚠️"
+ICON_TIP="😎"
+
+# ---- Colors -----------------------
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'  # No Color
+
+echo -e "\033[38;5;33m █████╗ ██████╗ ██████╗    ███╗   ███╗ ██████╗ ██████╗ ██╗██╗     ███████╗\033[0m"
+echo -e "\033[38;5;33m██╔══██╗██╔══██╗██╔══██╗   ████╗ ████║██╔═══██╗██╔══██╗██║██║     ██╔════╝\033[0m"
+echo -e "\033[38;5;39m███████║██║  ██║██║  ██║   ██╔████╔██║██║   ██║██████╔╝██║██║     █████╗  \033[0m"
+echo -e "\033[38;5;39m██╔══██║██║  ██║██║  ██║   ██║╚██╔╝██║██║   ██║██╔══██╗██║██║     ██╔══╝  \033[0m"
+echo -e "\033[38;5;45m██║  ██║██████╔╝██████╔╝   ██║ ╚═╝ ██║╚██████╔╝██████╔╝██║███████╗███████╗\033[0m"
+echo -e "\033[38;5;45m╚═╝  ╚═╝╚═════╝ ╚═════╝    ╚═╝     ╚═╝ ╚═════╝ ╚═════╝ ╚═╝╚══════╝╚══════╝\033[0m"
+
+echo -e "${BLUE}ADD Systems, Inc.${NC}"
+
+echo -e "${YELLOW}------------------------------------ ENV -----------------------------------${NC}"
+echo -e "${YELLOW} HTTP_PORT ${NC}${HTTP_PORT}"
+echo -e "${YELLOW} GATEWAY_URL ${NC}${GATEWAY_URL}"
+echo -e "${YELLOW}------------------------------------ ENV -----------------------------------${NC}"
 
 teardown() {
-  echo ">> Removing pod '${POD_NAME}' (if it exists)..."
-  podman pod rm -f "${POD_NAME}" 2>/dev/null || true
-  echo ">> Done."
+  if podman pod exists mobile-pod; then
+    echo -e "${RED}Removing pod ${GREEN}'${POD_NAME}'${NC} ..."
+    podman pod rm -f "${POD_NAME}" 2>/dev/null || true
+    echo "Done."
+  fi
 }
 
 if [[ "${1:-}" == "down" ]]; then
@@ -41,29 +71,36 @@ fi
 # Clean up any previous run so this script is idempotent
 teardown
 
+echo -e "${BLUE}Login to ${REGISTRY}${NC}"
+
 read -r -p "Username: " USERNAME < /dev/tty
 read -r -s -p "Password: " PASSWORD < /dev/tty
-echo
 
 # Pass the password via stdin so it never appears in process listings
 # (e.g. `ps aux`) or shell history.
 if printf '%s' "${PASSWORD}" | podman login "${REGISTRY}" --username "${USERNAME}" --password-stdin; then
-  echo ">> Successfully logged in to ${REGISTRY} as ${USERNAME}."
+  echo -e "${ICON_THUMBSUP} ${GREEN} Successfully logged in to ${REGISTRY} as ${USERNAME}.${NC}"
 else
-  echo ">> Login to ${REGISTRY} failed." >&2
+  echo -e "${ICON_THUMBSDOWN} ${RED} Login to ${REGISTRY} failed.${NC}" >&2
   exit 1
 fi
 
-if [ -z "${AUTH_URL}" ]; then
-  read -p "Enter ADD-Gateway URL: " AUTH_URL
+if [ -z "${GATEWAY_URL}" ]; then
+  echo "" 
+  echo -e "${ICON_WARN} ${YELLOW} GATEWAY_URL is not set.${NC}" 
+  echo ""
+  echo -e "${ICON_TIP} ${BLUE} Tip: Set the environment varialbe GATEWAY_URL during login ${GREEN}(e.g. ~/.bashrc, ~/.cshrc, ~/.zshrc)${BLUE} so you don't have to type it in${NC}"
+
+  echo ""
+  read -p "Enter GATEWAY_URL (i.e. https://<gateway>.<yourdomain>:39079): " GATEWAY_URL
 fi
 
-STATUS_CODE=$(curl -s -o /dev/null -w "%{http_code}" "${AUTH_URL}")
+STATUS_CODE=$(curl -s -o /dev/null -w "%{http_code}" "${GATEWAY_URL}")
 
 if [ "$STATUS_CODE" -eq 200 ]; then
-    echo "✅  Success: {AUTH_URL} returned HTTP 200"
+    echo -e "${ICON_THUMBSUP} ${GREEN} Success:${GATEWAY_URL} returned HTTP 200 ${NC}"
 else
-    echo "❌  Failed: {AUTH_URL} returned HTTP $STATUS_CODE"
+    echo -e "${ICON_THUMBSDOWN} ${RED} Failed:${GATEWAY_URL} returned HTTP $STATUS_CODE ${NC}"
     exit 1
 fi
 
@@ -136,7 +173,7 @@ podman run -d \
   --pod "${POD_NAME}" \
   --name mobileservices \
   -e ASPNETCORE_URLS="http://0.0.0.0:${MOBILESERVICES_PORT}" \
-  -e AUTH_URL=${AUTH_URL} \
+  -e AUTH_URL=${GATEWAY_URL} \
   "${MOBILESERVICES_IMAGE}"
 
 # ---- 5. service2 --------------------------------------------------------------
