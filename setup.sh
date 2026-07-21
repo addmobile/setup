@@ -14,14 +14,14 @@ ADDMOBILEPORTAL_IMAGE="${SERVICE2_IMAGE:-registry.mobile-developer.com/add-mobil
 NGINX_IMAGE="${NGINX_IMAGE:-docker.io/library/nginx:alpine}"
 
 # ---- Ports (host-published ports on the pod) -------------------------------
-HTTP_PORT="${HTTP_PORT:-4444}"          # nginx entrypoint
 KAFKA_PORT="${KAFKA_PORT:-9092}"
 MONGO_PORT="${MONGO_PORT:-27017}"
+MOBILEAPI_PORT="${MOBILEAPI_PORT:-8080}" # nginx entrypoint
 MOBILESERVICES_PORT="${MOBILESERVICES_PORT:-8081}"
 ADDMOBILEPORTAL_PORT="${SERVICE2_PORT:-8082}"
 
 # ---- Local config/data dirs -------------------------------------------------
-BASE_DIR="${HOME}/mobile-pod"
+BASE_DIR="${HOME}/ADD_MOBILE"
 CONF_DIR="${BASE_DIR}/conf"
 DATA_DIR="${BASE_DIR}/data"
 KAFKA_DIR="${DATA_DIR}/kafka"
@@ -51,7 +51,7 @@ echo -e "\033[38;5;45m╚═╝  ╚═╝╚═════╝ ╚════�
 echo -e "${BLUE}ADD Systems, Inc.${NC}"
 
 echo -e "${YELLOW}------------------------------------ ENV -----------------------------------${NC}"
-echo -e "${YELLOW} HTTP_PORT ${NC}${HTTP_PORT}"
+echo -e "${YELLOW} MOBILEAPI_PORT ${NC}${MOBILEAPI_PORT}"
 echo -e "${YELLOW} GATEWAY_URL ${NC}${GATEWAY_URL}"
 echo -e "${YELLOW}------------------------------------ ENV -----------------------------------${NC}"
 
@@ -112,9 +112,7 @@ echo ""
 echo -e "${YELLOW}>> Creating pod '${POD_NAME}'..."
 podman pod create \
   --name "${POD_NAME}" \
-  -p "${HTTP_PORT}:80" \
-  -p "8081:8081" \
-  -p "8082:8082" \
+  -p "${MOBILEAPI_PORT}:80" \
   -p "${MOBILESERVICES_PORT}:${MOBILESERVICES_PORT}"
 
 
@@ -216,7 +214,15 @@ http {
         }
 
         location /health {
-          return 200 "Ok!";
+          return 200 "NGINX OK!"; 
+        }
+
+        location /amp/health {
+          proxy_pass "http://127.0.0.1:${ADDMOBILEPORTAL_PORT}/health";
+        }
+
+        location /ms/health {
+          proxy_pass "http://127.0.0.1:${MOBILESERVICES_PORT}/auth/ping"; 
         }
     }
 }
@@ -233,6 +239,6 @@ echo -e ">> All containers started. Pod status:${GREEN}"
 podman pod ps
 podman ps --pod
 
-echo -e "\n${BLUE}Listening to http://127.0.0.1:${HTTP_PORT}\n${NC}"
+echo -e "\n${BLUE}Listening to http://127.0.0.1:${MOBILEAPI_PORT}\n${NC}"
 
 unset PASSWORD
