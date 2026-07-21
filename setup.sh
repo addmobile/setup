@@ -85,11 +85,18 @@ else
   exit 1
 fi
 
+if [ -z "${MOBILEAPI_PORT}" ]; then;
+  echo -e "${ICON_TIP} ${BLUE} Tip: Set the environment variable MOBILEAPI_PORT during login ${GREEN}(e.g. ~/.bashrc, ~/.cshrc, ~/.zshrc)${BLUE} so you don't have to enter it here.${NC}"
+  read -p "PORT (default: 8080): " MOBILEAPI_PORT
+  MOBILEAPI_PORT="${MOBILEAPI_PORT:-8080}"
+  echo "PORT: ${MOBILEAPI_PORT}"
+fi 
+
 if [ -z "${GATEWAY_URL}" ]; then
   echo "" 
   echo -e "${ICON_WARN} ${YELLOW} GATEWAY_URL is not set.${NC}" 
   echo ""
-  echo -e "${ICON_TIP} ${BLUE} Tip: Set the environment variable GATEWAY_URL during login ${GREEN}(e.g. ~/.bashrc, ~/.cshrc, ~/.zshrc)${BLUE} so you don't have to type it in${NC}"
+  echo -e "${ICON_TIP} ${BLUE} Tip: Set the environment variable GATEWAY_URL during login ${GREEN}(e.g. ~/.bashrc, ~/.cshrc, ~/.zshrc)${BLUE} so you don't have to enter it here.${NC}"
 
   echo ""
   read -p "Enter GATEWAY_URL (i.e. https://<gateway>.<yourdomain>:39079): " GATEWAY_URL
