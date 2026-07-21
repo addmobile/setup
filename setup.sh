@@ -54,7 +54,9 @@ else
   exit 1
 fi
 
-read -p "Enter ADD-Gateway URL: " AUTH_URL
+if [ -z "${AUTH_URL}" ]; then
+  read -p "Enter ADD-Gateway URL: " AUTH_URL
+fi
 
 STATUS_CODE=$(curl -s -o /dev/null -w "%{http_code}" "${AUTH_URL}")
 
