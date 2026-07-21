@@ -24,6 +24,8 @@ ADDMOBILEPORTAL_PORT="${SERVICE2_PORT:-8082}"
 BASE_DIR="${HOME}/mobile-pod"
 CONF_DIR="${BASE_DIR}/conf"
 DATA_DIR="${BASE_DIR}/data"
+KAFKA_DIR="${DATA_DIR}/kafka"
+MONGODB_DIR="${DATA_DIR}/mongo"
 
 teardown() {
   echo ">> Removing pod '${POD_NAME}' (if it exists)..."
@@ -63,7 +65,7 @@ else
     exit 1
 fi
 
-mkdir -p "${CONF_DIR}" "${DATA_DIR}/mongo" "${DATA_DIR}/kafka"
+mkdir -m 777 -p "${CONF_DIR}" "${DATA_DIR}/mongo" "${DATA_DIR}/kafka"
 
 # ---- 1. Create the pod ------------------------------------------------------
 echo ">> Creating pod '${POD_NAME}'..."
@@ -71,6 +73,15 @@ podman pod create \
   --name "${POD_NAME}" \
   -p "${HTTP_PORT}:80" \
   -p "${MOBILESERVICES_PORT}:${MOBILESERVICES_PORT}"
+
+
+if command -v getenforce >/dev/null 2>&1 && [ "$(getenforce)" != "Disabled" ]; then
+      VOLUME_SUFFIX=":Z"
+    else
+      VOLUME_SUFFIX=""
+fi
+
+echo "Using volume suffix '$VOLUME_SUFFIX'"
 
 # ---- 2. Kafka (KRaft single-node mode, no ZooKeeper required) --------------
 echo ">> Starting kafka..."
@@ -80,15 +91,15 @@ podman run -d \
   --name kafka \
   --restart always \
   --memory 1g --memory-swap 1g \
-  --volume "${DATA_DIR}/kafka:/var/lib/kafka/data:Z" \
+  --volume "${KAFKA_DIR}:/var/lib/kafka/data${VOLUME_SUFFIX}" \
   --env KAFKA_LOG_DIRS=/var/lib/kafka/data \
   --env KAFKA_NODE_ID=1 \
   --env KAFKA_PROCESS_ROLES=broker,controller \
   --env KAFKA_LISTENERS=PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093 \
-  --env KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://localhost:9092 \
+  --env KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092 \
   --env KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER \
   --env KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT \
-  --env KAFKA_CONTROLLER_QUORUM_VOTERS=1@localhost:9093 \
+  --env KAFKA_CONTROLLER_QUORUM_VOTERS=1@kafka:9093 \
   --env KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1 \
   --env KAFKA_OFFSETS_TOPIC_NUM_PARTITIONS=1 \
   --env KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1 \
@@ -102,14 +113,14 @@ podman run -d \
   
 
 # ---- 3. MongoDB --------------------------------------------------------------
-echo ">> Starting mongodb..."
+echo ">> Starting Mongodb..."
 
 podman run -d \
   --pod "${POD_NAME}" \
   --name mongodb \
   --restart always \
   --memory 768m --memory-swap 768m \
-  --volume "${DATA_DIR}/mongo:/data/db:Z" \
+  --volume "${MONGODB_DIR}:/data/db${VOLUME_SUFFIX}" \
   --volume mongo-configdb:/data/configdb \
   "${MONGO_IMAGE}" \
   --bind_ip_all \
@@ -118,7 +129,7 @@ podman run -d \
   --setParameter diagnosticDataCollectionEnabled=false
 
 # ---- 4. service1 --------------------------------------------------------------
-echo ">> Starting mobileservices..."
+echo ">> Starting MobileServices..."
 podman run -d \
   --pod "${POD_NAME}" \
   --name mobileservices \
@@ -127,13 +138,13 @@ podman run -d \
   "${MOBILESERVICES_IMAGE}"
 
 # ---- 5. service2 --------------------------------------------------------------
-echo ">> Starting service2..."
+echo ">> Starting ADD-MOBILEPORTAL..."
 podman run -d \
   --pod "${POD_NAME}" \
   --name add-mobileportal \
   -e PORT="${ADDMOBILEPORTAL_PORT}" \
   -e MONGO_URL="mongodb://127.0.0.1:${MONGO_PORT}" \
-  -e KAFKA_BROKER="127.0.0.1:${KAFKA_PORT}" \
+  -e KAFKA_BROKERS="kafka:${KAFKA_PORT}" \
   "${ADDMOBILEPORTAL_IMAGE}"
 
 # ---- 6. NGINX reverse proxy -> service2 --------------------------------------
