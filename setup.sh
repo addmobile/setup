@@ -161,12 +161,8 @@ http {
             proxy_set_header    X-Forwarded-Proto \$scheme;
         }
 
-        location /auth/ping {
-          proxy_pass http://127.0.0.1:${MOBILESERVICES_PORT}/auth/ping; 
-        }
-
         location /health {
-          return 200 "Ok!"
+          return 200 "Ok!";
         }
     }
 }
