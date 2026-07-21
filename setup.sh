@@ -9,12 +9,12 @@ REGISTRY="https://registry.mobile-developer.com"
 # ---- Images (override via env vars if you have your own) -----------------
 KAFKA_IMAGE="${KAFKA_IMAGE:-docker.io/apache/kafka:4.3.1}"
 MONGO_IMAGE="${MONGO_IMAGE:-docker.io/library/mongo:8.2.3-noble}"
-MOBILESERVICES_IMAGE="${MOBILESERVICES_IMAGE:-registry.mobile-developer.com/mobileservices:v0.0.3}"
+MOBILESERVICES_IMAGE="${MOBILESERVICES_IMAGE:-registry.mobile-developer.com/mobileservices:v0.0.4}"
 ADDMOBILEPORTAL_IMAGE="${SERVICE2_IMAGE:-registry.mobile-developer.com/add-mobileportal:v1.0.0.30}"
 NGINX_IMAGE="${NGINX_IMAGE:-docker.io/library/nginx:alpine}"
 
 # ---- Ports (host-published ports on the pod) -------------------------------
-HTTP_PORT="${HTTP_PORT:-4001}"          # nginx entrypoint
+HTTP_PORT="${HTTP_PORT:-4444}"          # nginx entrypoint
 KAFKA_PORT="${KAFKA_PORT:-9092}"
 MONGO_PORT="${MONGO_PORT:-27017}"
 MOBILESERVICES_PORT="${MOBILESERVICES_PORT:-8081}"
@@ -57,9 +57,9 @@ read -p "Enter ADD-Gateway URL: " AUTH_URL
 STATUS_CODE=$(curl -s -o /dev/null -w "%{http_code}" "${AUTH_URL}")
 
 if [ "$STATUS_CODE" -eq 200 ]; then
-    echo "✅ Success: {AUTH_URL} returned HTTP 200"
+    echo "✅  Success: {AUTH_URL} returned HTTP 200"
 else
-    echo "❌ Failed: {AUTH_URL} returned HTTP $STATUS_CODE"
+    echo "❌  Failed: {AUTH_URL} returned HTTP $STATUS_CODE"
     exit 1
 fi
 
@@ -69,7 +69,8 @@ mkdir -p "${CONF_DIR}" "${DATA_DIR}/mongo" "${DATA_DIR}/kafka"
 echo ">> Creating pod '${POD_NAME}'..."
 podman pod create \
   --name "${POD_NAME}" \
-  -p "${HTTP_PORT}:80"
+  -p "${HTTP_PORT}:80" \
+  -p "${MOBILESERVICES_PORT}:${MOBILESERVICES_PORT}"
 
 # ---- 2. Kafka (KRaft single-node mode, no ZooKeeper required) --------------
 echo ">> Starting kafka..."
@@ -121,7 +122,8 @@ echo ">> Starting mobileservices..."
 podman run -d \
   --pod "${POD_NAME}" \
   --name mobileservices \
-  -e PORT="${MOBILESERVICES_PORT}" \
+  -e ASPNETCORE_URLS="http://0.0.0.0:${MOBILESERVICES_PORT}" \
+  -e AUTH_URL=${AUTH_URL} \
   "${MOBILESERVICES_IMAGE}"
 
 # ---- 5. service2 --------------------------------------------------------------
@@ -141,11 +143,18 @@ events {}
 
 http {
     server {
-        listen ${HTTP_PORT};
+        listen 80;
+
+        location /gateway/auth/ {
+          internal; 
+          proxy_set_header      Content-Length ""; 
+          proxy_set_header      X-Original-URI   \$request_uri;
+          proxy_pass            http://127.0.0.1:${MOBILESERVICES_PORT}/auth/verify;
+        }
 
         location / {
-            auth_request        http://127.0.0.1:${MOBILESERVICES_PORT};
-            proxy_pass         http://127.0.0.1:${ADDMOBILEPORTAL_PORT};
+            auth_request        /gateway/auth/;
+            proxy_pass          http://127.0.0.1:${ADDMOBILEPORTAL_PORT};
             proxy_set_header    Host \$host;
             proxy_set_header    X-Real-IP \$remote_addr;
             proxy_set_header    X-Forwarded-For \$proxy_add_x_forwarded_for;
@@ -153,7 +162,11 @@ http {
         }
 
         location /auth/ping {
-          proxy_pass http://127.0.01.:${MOBILESERVICES_PORT}/auth/ping; 
+          proxy_pass http://127.0.0.1:${MOBILESERVICES_PORT}/auth/ping; 
+        }
+
+        location /health {
+          return 200 "Ok!"
         }
     }
 }
