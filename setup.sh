@@ -57,9 +57,9 @@ echo -e "${YELLOW}------------------------------------ ENV ---------------------
 
 teardown() {
   if podman pod exists mobile-pod; then
-    echo -e "${RED}Removing pod ${GREEN}'${POD_NAME}'${NC} ..."
+    echo -e "${RED}Removing pod ${GREEN}'${POD_NAME}'${NC}"
     podman pod rm -f "${POD_NAME}" 2>/dev/null || true
-    echo "Done."
+    echo ""
   fi
 }
 
@@ -89,7 +89,7 @@ if [ -z "${GATEWAY_URL}" ]; then
   echo "" 
   echo -e "${ICON_WARN} ${YELLOW} GATEWAY_URL is not set.${NC}" 
   echo ""
-  echo -e "${ICON_TIP} ${BLUE} Tip: Set the environment varialbe GATEWAY_URL during login ${GREEN}(e.g. ~/.bashrc, ~/.cshrc, ~/.zshrc)${BLUE} so you don't have to type it in${NC}"
+  echo -e "${ICON_TIP} ${BLUE} Tip: Set the environment variable GATEWAY_URL during login ${GREEN}(e.g. ~/.bashrc, ~/.cshrc, ~/.zshrc)${BLUE} so you don't have to type it in${NC}"
 
   echo ""
   read -p "Enter GATEWAY_URL (i.e. https://<gateway>.<yourdomain>:39079): " GATEWAY_URL
@@ -106,11 +106,15 @@ fi
 
 mkdir -m 777 -p "${CONF_DIR}" "${DATA_DIR}/mongo" "${DATA_DIR}/kafka"
 
+echo ""
+
 # ---- 1. Create the pod ------------------------------------------------------
-echo ">> Creating pod '${POD_NAME}'..."
+echo -e "${YELLOW}>> Creating pod '${POD_NAME}'..."
 podman pod create \
   --name "${POD_NAME}" \
   -p "${HTTP_PORT}:80" \
+  -p "8081:8081" \
+  -p "8082:8082" \
   -p "${MOBILESERVICES_PORT}:${MOBILESERVICES_PORT}"
 
 
@@ -134,7 +138,7 @@ podman run -d \
   --env KAFKA_LOG_DIRS=/var/lib/kafka/data \
   --env KAFKA_NODE_ID=1 \
   --env KAFKA_PROCESS_ROLES=broker,controller \
-  --env KAFKA_LISTENERS=PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093 \
+  --env KAFKA_LISTENERS=PLAINTEXT://127.0.0.1:9092,CONTROLLER://127.0.0.1:9093 \
   --env KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://kafka:9092 \
   --env KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER \
   --env KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT \
@@ -181,7 +185,7 @@ echo ">> Starting ADD-MOBILEPORTAL..."
 podman run -d \
   --pod "${POD_NAME}" \
   --name add-mobileportal \
-  -e PORT="${ADDMOBILEPORTAL_PORT}" \
+  -e API_PORT="${ADDMOBILEPORTAL_PORT}" \
   -e MONGO_URL="mongodb://127.0.0.1:${MONGO_PORT}" \
   -e KAFKA_BROKERS="kafka:${KAFKA_PORT}" \
   "${ADDMOBILEPORTAL_IMAGE}"
@@ -225,8 +229,10 @@ podman run -d \
   -v "${CONF_DIR}/nginx.conf:/etc/nginx/nginx.conf:ro,Z" \
   "${NGINX_IMAGE}"
 
-echo ">> All containers started. Pod status:"
+echo -e ">> All containers started. Pod status:${GREEN}"
 podman pod ps
 podman ps --pod
+
+echo -e "\n${BLUE}Listening to http://127.0.0.1:${HTTP_PORT}\n${NC}"
 
 unset PASSWORD
