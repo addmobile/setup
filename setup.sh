@@ -218,7 +218,7 @@ http {
 
         location / {
             auth_request        /gateway/auth/;
-            error_page          401 = @unauthorized
+            error_page          401 = @unauthorized;
             proxy_pass          http://127.0.0.1:${ADDMOBILEPORTAL_PORT};
             proxy_set_header    Host \$host;
             proxy_set_header    X-Real-IP \$remote_addr;
