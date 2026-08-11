@@ -4,7 +4,7 @@ set -euo pipefail
 
 POD_NAME="mobile-pod"
 
-REGISTRY="https://registry.mobile-developer.com"
+REGISTRY="https://hub.addsys.com:33443"
 
 # ---- Images (override via env vars if you have your own) -----------------
 KAFKA_IMAGE="${KAFKA_IMAGE:-docker.io/apache/kafka:4.3.1}"
