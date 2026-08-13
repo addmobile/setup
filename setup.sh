@@ -57,6 +57,18 @@ echo -e "\033[38;5;45m╚═╝  ╚═╝╚═════╝ ╚════�
 
 echo -e "${BLUE}ADD Systems, Inc.${NC}"
 
+# Bind-mounted data directories have to be writable by the container's user, which rootless
+# podman maps into the installing user's subuid range
+prepare_data_dir() {
+  local dir="$1"
+  mkdir -p "$dir"
+  if [ -O "$dir" ]; then
+    chmod 777 "$dir"
+  else
+    echo "   ${dir} already belongs to uid $(stat -c %u "$dir" 2>/dev/null) from an earlier install; leaving its permissions alone."
+  fi
+}
+
 teardown() {
   if podman pod exists "${POD_NAME}"; then
     echo -e "${RED}Removing pod ${GREEN}'${POD_NAME}'${NC}"
@@ -171,11 +183,10 @@ else
     exit 1
 fi
 
-mkdir -p "${CONF_DIR}" "${MONGODB_DIR}"
-chmod 777 "${CONF_DIR}" "${MONGODB_DIR}"
+prepare_data_dir "${CONF_DIR}"
+prepare_data_dir "${MONGODB_DIR}"
 if [ -n "${KAFKA_BROKERS}" ]; then
-  mkdir -p "${KAFKA_DIR}"
-  chmod 777 "${KAFKA_DIR}"
+  prepare_data_dir "${KAFKA_DIR}"
 fi
 
 # ---- Pull every image before touching the running pod ------------------------
