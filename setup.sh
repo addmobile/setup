@@ -91,6 +91,17 @@ for tool in podman curl loginctl; do
   fi
 done
 
+# Bun 1.3.14 grows kernel memory mappings over the life of a process (oven-sh/bun#17723; the
+# allocator fix lands in 1.4). When vm.max_map_count is reached the process spins on a retrying
+# madvise instead of crashing, so it presents as a hang rather than a restart. A container cannot
+# raise this -- it is a host setting -- and the default of 65530 is low for a 24/7 server.
+MAX_MAP_COUNT="$(cat /proc/sys/vm/max_map_count 2>/dev/null || echo 0)"
+if [ "${MAX_MAP_COUNT}" -lt 262144 ] 2>/dev/null; then
+  echo -e "${BLUE}Note: vm.max_map_count is ${MAX_MAP_COUNT}. Raising it is recommended for a long-running pod:${NC}"
+  echo -e "${GREEN}  echo 'vm.max_map_count=262144' | sudo tee /etc/sysctl.d/99-addmobile.conf && sudo sysctl --system${NC}"
+  echo ""
+fi
+
 if ! podman info >/dev/null 2>&1; then
   echo -e "${ICON_THUMBSDOWN} ${RED} podman is installed but not working for ${USER} (rootless setup incomplete?).${NC}" >&2
   echo -e "${BLUE} Diagnose with: ${GREEN}podman info${NC}" >&2
@@ -113,8 +124,14 @@ else
 fi
 
 # ---- Resolve image tags from the registry (latest v-prefixed tag wins) -------
+# Credentials go in through --config on stdin, never on the command line: an argument is
+# visible in `ps` to every user on the box. (podman login already uses --password-stdin.)
 latest_tag() {
-  curl -fsS -u "${USERNAME}:${PASSWORD}" "${REGISTRY}/v2/$1/tags/list" 2>/dev/null \
+  local escaped="${USERNAME}:${PASSWORD}"
+  escaped="${escaped//\\/\\\\}"
+  escaped="${escaped//\"/\\\"}"
+  printf 'user = "%s"\n' "${escaped}" \
+    | curl -fsS --config - "${REGISTRY}/v2/$1/tags/list" 2>/dev/null \
     | tr ',' '\n' \
     | grep -oE '"v[0-9][^"]*"' \
     | tr -d '"' \
@@ -210,17 +227,17 @@ done
 # ---- nginx config ------------------------------------------------------------
 echo ""
 echo -e "${BLUE}Rendering nginx config (${CONF_DIR}/nginx.conf)...${NC}"
-if ! NGINX_TEMPLATE="$(podman run --rm --entrypoint cat "${ADDMOBILEPORTAL_IMAGE}" /app/deploy/nginx.conf.template 2>/dev/null)" \
-   || [ -z "${NGINX_TEMPLATE}" ]; then
-  echo -e "${ICON_THUMBSDOWN} ${RED} ${ADDMOBILEPORTAL_IMAGE} does not ship /app/deploy/nginx.conf.template.${NC}" >&2
-  echo -e "${BLUE} Pull an add-mobileportal release built after the nginx template was added.${NC}" >&2
+if ! podman run --rm "${ADDMOBILEPORTAL_IMAGE}" --print-nginx-conf > "${CONF_DIR}/nginx.conf.template" 2>/dev/null \
+   || [ ! -s "${CONF_DIR}/nginx.conf.template" ]; then
+  echo -e "${ICON_THUMBSDOWN} ${RED} ${ADDMOBILEPORTAL_IMAGE} could not print its nginx template.${NC}" >&2
   exit 1
 fi
 
-printf '%s\n' "${NGINX_TEMPLATE}" \
-  | sed -e "s|__ADDMOBILEPORTAL_PORT__|${ADDMOBILEPORTAL_PORT}|g" \
-        -e "s|__MOBILESERVICES_PORT__|${MOBILESERVICES_PORT}|g" \
-  > "${CONF_DIR}/nginx.conf"
+sed -e "s|__ADDMOBILEPORTAL_PORT__|${ADDMOBILEPORTAL_PORT}|g" \
+    -e "s|__MOBILESERVICES_PORT__|${MOBILESERVICES_PORT}|g" \
+    "${CONF_DIR}/nginx.conf.template" > "${CONF_DIR}/nginx.conf.new"
+mv "${CONF_DIR}/nginx.conf.new" "${CONF_DIR}/nginx.conf"
+rm -f "${CONF_DIR}/nginx.conf.template"
 
 teardown
 
