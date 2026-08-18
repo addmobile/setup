@@ -35,8 +35,22 @@ $ curl -fsSL https://raw.githubusercontent.com/addmobile/setup/refs/heads/main/s
 $ curl -fsSL .../setup.sh | bash -s -- --add-mobileportal v1.0.0.32 --mobileservices v0.0.16
 ```
 
-Arguments go after the `--` when the script is piped from curl; without it they are read by
-`bash` rather than by the installer.
+**Use the piped `| bash -s --` form whenever you are passing anything.** The `bash -c "$(curl
+...)"` form at the top cannot carry arguments: with `bash -c SCRIPT word`, `word` becomes the
+script's `$0` rather than its first argument, so the installer sees no arguments at all and
+quietly does a default install instead of what you asked for.
+
+`setup.sh --help` prints the same summary.
+
+### Stopping the stack
+
+```
+$ curl -fsSL https://raw.githubusercontent.com/addmobile/setup/refs/heads/main/setup.sh | bash -s -- down
+```
+
+This removes the pod and leaves your data and rendered config in `~/ADD_MOBILE` alone. To remove
+the pod *and* clean up its volumes, use the uninstall command below instead. The same `$0` caveat
+applies here -- `bash -c "$(curl ...)" down` would reinstall the pod rather than remove it.
 
 ### You must put nginx in front of this
 

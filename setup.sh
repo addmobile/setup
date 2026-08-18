@@ -4,8 +4,13 @@ set -euo pipefail
 
 POD_NAME="mobile-pod"
 
-REGISTRY="${REGISTRY:-https://hub.addsys.com:33443}"
-REGISTRY_HOST="${REGISTRY#https://}"
+REGISTRY="${REGISTRY:-hub.addsys.com:33443}"
+REGISTRY_HOST="${REGISTRY#*://}"
+REGISTRY_HOST="${REGISTRY_HOST%/}"
+case "${REGISTRY}" in
+  http://*) REGISTRY_URL="http://${REGISTRY_HOST}" ;;
+  *)        REGISTRY_URL="https://${REGISTRY_HOST}" ;;
+esac
 PORTAL_REPO="add-mobileportal"
 MOBILESERVICES_REPO="mobileservices"
 SETUP_URL="https://raw.githubusercontent.com/addmobile/setup/refs/heads/main/setup.sh"
@@ -121,9 +126,6 @@ while [ $# -gt 0 ]; do
       exit 0
       ;;
     --latest)
-      # Explicit, so it also drops any image pinned in the environment.
-      ADDMOBILEPORTAL_VERSION="latest"; ADDMOBILEPORTAL_IMAGE=""
-      MOBILESERVICES_VERSION="latest";  MOBILESERVICES_IMAGE=""
       shift
       ;;
     --add-mobileportal)
@@ -181,7 +183,7 @@ if ! podman info >/dev/null 2>&1; then
   exit 1
 fi
 
-echo -e "${BLUE}Login to ${REGISTRY}${NC}"
+echo -e "${BLUE}Login to ${REGISTRY_HOST}${NC}"
 
 read -r -p "Username: " USERNAME < /dev/tty
 read -r -s -p "Password: " PASSWORD < /dev/tty
@@ -189,10 +191,10 @@ echo ""
 
 # Pass the password via stdin so it never appears in process listings
 # (e.g. `ps aux`) or shell history.
-if printf '%s' "${PASSWORD}" | podman login "${REGISTRY}" --username "${USERNAME}" --password-stdin; then
-  echo -e "${ICON_THUMBSUP} ${GREEN} Successfully logged in to ${REGISTRY} as ${USERNAME}.${NC}"
+if printf '%s' "${PASSWORD}" | podman login "${REGISTRY_HOST}" --username "${USERNAME}" --password-stdin; then
+  echo -e "${ICON_THUMBSUP} ${GREEN} Successfully logged in to ${REGISTRY_HOST} as ${USERNAME}.${NC}"
 else
-  echo -e "${ICON_THUMBSDOWN} ${RED} Login to ${REGISTRY} failed.${NC}" >&2
+  echo -e "${ICON_THUMBSDOWN} ${RED} Login to ${REGISTRY_HOST} failed.${NC}" >&2
   exit 1
 fi
 
@@ -200,15 +202,25 @@ fi
 # Credentials go in through --config on stdin, never on the command line: an argument is
 # visible in `ps` to every user on the box. (podman login already uses --password-stdin.)
 registry_tags() {
-  local escaped="${USERNAME}:${PASSWORD}"
+  local escaped="${USERNAME}:${PASSWORD}" body
   escaped="${escaped//\\/\\\\}"
   escaped="${escaped//\"/\\\"}"
-  printf 'user = "%s"\n' "${escaped}" \
-    | curl -fsS --config - "${REGISTRY}/v2/$1/tags/list" 2>/dev/null \
+
+  body="$(printf 'user = "%s"\n' "${escaped}" \
+    | curl -fsS --config - "${REGISTRY_URL}/v2/$1/tags/list" 2>/dev/null)" || return 1
+
+  printf '%s' "${body}" \
     | tr ',' '\n' \
     | grep -oE '"v[0-9][^"]*"' \
     | tr -d '"' \
     | sort -t. -k1,1V -k2,2n -k3,3n -k4,4n
+
+  # Normalises the trailing grep: no matching tags is an answer, not a failure.
+  return 0
+}
+
+release_tags() {
+  printf '%s\n' "$1" | grep -xE 'v[0-9]+(\.[0-9]+){1,3}'
 }
 
 version_below() {
@@ -220,7 +232,7 @@ RESOLVED_IMAGE=""
 RESOLVED_ORIGIN=""
 resolve_or_die() {
   local package="$1" requested="$2" override="$3" env_name="$4" flag="$5"
-  local tags tag
+  local tags releases tag
 
   if [ -n "$override" ]; then
     RESOLVED_IMAGE="$override"
@@ -228,20 +240,33 @@ resolve_or_die() {
     return 0
   fi
 
-  tags="$(registry_tags "$package" || true)"
-  if [ -z "$tags" ]; then
-    echo -e "${ICON_THUMBSDOWN} ${RED} Could not list published versions of ${package} on ${REGISTRY}.${NC}" >&2
+  if ! tags="$(registry_tags "$package")"; then
+    echo -e "${ICON_THUMBSDOWN} ${RED} ${REGISTRY_HOST} did not answer for ${package}.${NC}" >&2
     echo -e "${BLUE} Check the registry is reachable and your account can read ${package},${NC}" >&2
     echo -e "${BLUE} or name a full image explicitly: ${GREEN}export ${env_name}=${REGISTRY_HOST}/${package}:<tag>${NC}" >&2
     exit 1
   fi
+  if [ -z "$tags" ]; then
+    echo -e "${ICON_THUMBSDOWN} ${RED} ${REGISTRY_HOST} holds no published versions of ${package}.${NC}" >&2
+    echo -e "${BLUE} The registry answered, so this is an empty or unfamiliar repository rather than${NC}" >&2
+    echo -e "${BLUE} a connection problem. Check the name, or name a full image explicitly:${NC}" >&2
+    echo -e "${BLUE} ${GREEN}export ${env_name}=${REGISTRY_HOST}/${package}:<tag>${NC}" >&2
+    exit 1
+  fi
 
   if [ -z "$requested" ] || [ "$requested" = "latest" ]; then
-    tag="$(printf '%s\n' "$tags" | tail -1)"
+    releases="$(release_tags "$tags" || true)"
+    if [ -z "$releases" ]; then
+      echo -e "${ICON_THUMBSDOWN} ${RED} ${package} has no plain release version published.${NC}" >&2
+      echo -e "${BLUE} Every published tag is a pre-release or variant, and one of those is never${NC}" >&2
+      echo -e "${BLUE} installed by default. Ask for one by name if that is what you want:${NC}" >&2
+      printf '%s\n' "$tags" | tail -5 | sed 's/^/   /' >&2
+      exit 1
+    fi
+    tag="$(printf '%s\n' "$releases" | tail -1)"
     RESOLVED_ORIGIN="latest published"
   else
-    # Published tags carry the v; the flag accepts the version with or without it.
-    tag="v${requested#v}"
+    tag="v${requested#[vV]}"
     if ! printf '%s\n' "$tags" | grep -qxF "$tag"; then
       echo -e "${ICON_THUMBSDOWN} ${RED} ${package} has no published version ${tag}.${NC}" >&2
       echo -e "${BLUE} Newest published versions of ${package}:${NC}" >&2
@@ -278,8 +303,13 @@ case "${PORTAL_TAG}" in
     if version_below "${PORTAL_TAG}" "${PORTAL_MIN_VERSION}"; then
       echo -e "${ICON_THUMBSDOWN} ${RED} add-mobileportal ${PORTAL_TAG} is too old for this installer.${NC}" >&2
       echo -e "${BLUE} The nginx gate config ships inside the image and is read out of it, which${NC}" >&2
-      echo -e "${BLUE} ${PORTAL_MIN_VERSION} is the first release to support. Install ${GREEN}--add-mobileportal latest${BLUE},${NC}" >&2
-      echo -e "${BLUE} or any version from ${PORTAL_MIN_VERSION} up.${NC}" >&2
+      echo -e "${BLUE} ${PORTAL_MIN_VERSION} is the first release to support.${NC}" >&2
+      if [ "${ADDMOBILEPORTAL_ORIGIN}" = "latest published" ]; then
+        echo -e "${BLUE} ${PORTAL_TAG} is the newest version published, so there is nothing to install${NC}" >&2
+        echo -e "${BLUE} yet: ${PORTAL_MIN_VERSION} or later has to reach ${REGISTRY_HOST} first.${NC}" >&2
+      else
+        echo -e "${BLUE} Install ${GREEN}--add-mobileportal latest${BLUE}, or any version from ${PORTAL_MIN_VERSION} up.${NC}" >&2
+      fi
       exit 1
     fi
     ;;
@@ -300,6 +330,20 @@ if [ -z "${GATEWAY_URL}" ]; then
   echo -e "${ICON_TIP} ${BLUE} Tip: Set the environment variable GATEWAY_URL during login ${GREEN}(e.g. ~/.bashrc, ~/.cshrc, ~/.zshrc)${BLUE} so you don't have to enter it here.${NC}"
   echo ""
   read -r -p "Enter GATEWAY_URL (i.e. https://<gateway>.<yourdomain>:39079): " GATEWAY_URL < /dev/tty
+fi
+
+case "${MOBILEAPI_PORT}" in
+  ''|*[!0-9]*)
+    echo -e "${ICON_THUMBSDOWN} ${RED} MOBILEAPI_PORT must be a number, got '${MOBILEAPI_PORT}'.${NC}" >&2
+    exit 2
+    ;;
+esac
+if [ "${MOBILEAPI_PORT}" -lt 1 ] || [ "${MOBILEAPI_PORT}" -gt 65535 ]; then
+  echo -e "${ICON_THUMBSDOWN} ${RED} MOBILEAPI_PORT must be between 1 and 65535, got ${MOBILEAPI_PORT}.${NC}" >&2
+  exit 2
+fi
+if [ "${MOBILEAPI_PORT}" -lt 1024 ]; then
+  echo -e "${ICON_WARN} ${YELLOW} Ports below 1024 need net.ipv4.ip_unprivileged_port_start lowered before rootless podman can bind them.${NC}" >&2
 fi
 
 echo -e "${YELLOW}------------------------------------ ENV -----------------------------------${NC}"
@@ -346,11 +390,12 @@ echo ""
 echo -e "${BLUE}Rendering nginx config (${CONF_DIR}/nginx.conf)...${NC}"
 if ! podman run --rm "${ADDMOBILEPORTAL_IMAGE}" --print-nginx-conf > "${CONF_DIR}/nginx.conf.template" 2>/dev/null \
    || [ ! -s "${CONF_DIR}/nginx.conf.template" ]; then
+  rm -f "${CONF_DIR}/nginx.conf.template"
   echo -e "${ICON_THUMBSDOWN} ${RED} ${ADDMOBILEPORTAL_IMAGE} could not print its nginx template.${NC}" >&2
   echo -e "${BLUE} Every release from ${PORTAL_MIN_VERSION} answers --print-nginx-conf. An image that does not${NC}" >&2
   echo -e "${BLUE} is either older than that or not an add-mobileportal image at all -- check any${NC}" >&2
   echo -e "${BLUE} ADDMOBILEPORTAL_IMAGE set in the environment, or install ${GREEN}--add-mobileportal latest${BLUE}.${NC}" >&2
-  echo -e "${BLUE} Nothing has been changed; the running pod, if any, is untouched.${NC}" >&2
+  echo -e "${BLUE} The running pod, if any, is untouched -- nothing is removed until after this step.${NC}" >&2
   exit 1
 fi
 
