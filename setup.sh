@@ -8,13 +8,15 @@ REGISTRY="${REGISTRY:-https://hub.addsys.com:33443}"
 REGISTRY_HOST="${REGISTRY#https://}"
 PORTAL_REPO="add-mobileportal"
 MOBILESERVICES_REPO="mobileservices"
+SETUP_URL="https://raw.githubusercontent.com/addmobile/setup/refs/heads/main/setup.sh"
 UNINSTALL_CMD='bash -c "$(curl -fsSL https://raw.githubusercontent.com/addmobile/setup/refs/heads/main/clear.sh)"'
+PORTAL_MIN_VERSION="v1.0.0.32"
 
 # ---- Images (override via env vars if you have your own) -----------------
 KAFKA_IMAGE="${KAFKA_IMAGE:-docker.io/apache/kafka:4.3.1}"
 MONGO_IMAGE="${MONGO_IMAGE:-docker.io/library/mongo:8.2.3-noble}"
 MOBILESERVICES_IMAGE="${MOBILESERVICES_IMAGE:-}"
-ADDMOBILEPORTAL_IMAGE="${SERVICE2_IMAGE:-}"
+ADDMOBILEPORTAL_IMAGE="${ADDMOBILEPORTAL_IMAGE:-${SERVICE2_IMAGE:-}}"
 NGINX_IMAGE="${NGINX_IMAGE:-docker.io/library/nginx:alpine}"
 
 # ---- Ports (in-pod, nginx ports) -----------------------------------------
@@ -77,10 +79,85 @@ teardown() {
   fi
 }
 
-if [[ "${1:-}" == "down" ]]; then
-  teardown
-  exit 0
-fi
+# ---- Arguments ---------------------------------------------------------------
+ADDMOBILEPORTAL_VERSION=""
+MOBILESERVICES_VERSION=""
+
+usage() {
+  cat <<EOF
+Usage: setup.sh [--add-mobileportal <version>] [--mobileservices <version>] [--latest]
+       setup.sh down
+
+Packages:
+  add-mobileportal   the API server
+  mobileservices     the auth verify service every gated request is checked against
+
+Options:
+  --add-mobileportal <version>   install this version of add-mobileportal
+  --mobileservices <version>     install this version of mobileservices
+  --latest                       install the newest published version of both (the default)
+  down                           remove the pod and exit
+  -h, --help                     show this message
+
+Running straight from the installer URL, arguments go after a "--":
+  curl -fsSL ${SETUP_URL} | bash -s -- --add-mobileportal v1.0.0.32
+EOF
+}
+
+require_version_value() {
+  local flag="$1" value="${2:-}"
+  case "$value" in
+    ''|-*)
+      echo -e "${ICON_THUMBSDOWN} ${RED} ${flag} needs a version -- ${flag} <version>, or ${flag} latest for the newest published.${NC}" >&2
+      exit 2
+      ;;
+  esac
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    down)
+      teardown
+      exit 0
+      ;;
+    --latest)
+      # Explicit, so it also drops any image pinned in the environment.
+      ADDMOBILEPORTAL_VERSION="latest"; ADDMOBILEPORTAL_IMAGE=""
+      MOBILESERVICES_VERSION="latest";  MOBILESERVICES_IMAGE=""
+      shift
+      ;;
+    --add-mobileportal)
+      require_version_value "$1" "${2:-}"
+      ADDMOBILEPORTAL_VERSION="$2"; ADDMOBILEPORTAL_IMAGE=""
+      shift 2
+      ;;
+    --add-mobileportal=*)
+      ADDMOBILEPORTAL_VERSION="${1#*=}"; ADDMOBILEPORTAL_IMAGE=""
+      require_version_value "--add-mobileportal" "${ADDMOBILEPORTAL_VERSION}"
+      shift
+      ;;
+    --mobileservices)
+      require_version_value "$1" "${2:-}"
+      MOBILESERVICES_VERSION="$2"; MOBILESERVICES_IMAGE=""
+      shift 2
+      ;;
+    --mobileservices=*)
+      MOBILESERVICES_VERSION="${1#*=}"; MOBILESERVICES_IMAGE=""
+      require_version_value "--mobileservices" "${MOBILESERVICES_VERSION}"
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo -e "${ICON_THUMBSDOWN} ${RED} Unknown argument: ${1}${NC}" >&2
+      echo "" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
 
 # ---- Host prerequisites ------------------------------------------------------
 for tool in podman curl loginctl; do
@@ -91,10 +168,6 @@ for tool in podman curl loginctl; do
   fi
 done
 
-# Bun 1.3.14 grows kernel memory mappings over the life of a process (oven-sh/bun#17723; the
-# allocator fix lands in 1.4). When vm.max_map_count is reached the process spins on a retrying
-# madvise instead of crashing, so it presents as a hang rather than a restart. A container cannot
-# raise this -- it is a host setting -- and the default of 65530 is low for a 24/7 server.
 MAX_MAP_COUNT="$(cat /proc/sys/vm/max_map_count 2>/dev/null || echo 0)"
 if [ "${MAX_MAP_COUNT}" -lt 262144 ] 2>/dev/null; then
   echo -e "${BLUE}Note: vm.max_map_count is ${MAX_MAP_COUNT}. Raising it is recommended for a long-running pod:${NC}"
@@ -123,10 +196,10 @@ else
   exit 1
 fi
 
-# ---- Resolve image tags from the registry (latest v-prefixed tag wins) -------
+# ---- Resolve image tags from the registry ------------------------------------
 # Credentials go in through --config on stdin, never on the command line: an argument is
 # visible in `ps` to every user on the box. (podman login already uses --password-stdin.)
-latest_tag() {
+registry_tags() {
   local escaped="${USERNAME}:${PASSWORD}"
   escaped="${escaped//\\/\\\\}"
   escaped="${escaped//\"/\\\"}"
@@ -135,38 +208,82 @@ latest_tag() {
     | tr ',' '\n' \
     | grep -oE '"v[0-9][^"]*"' \
     | tr -d '"' \
-    | sort -t. -k1,1V -k2,2n -k3,3n -k4,4n \
-    | tail -1
+    | sort -t. -k1,1V -k2,2n -k3,3n -k4,4n
 }
 
-# An explicit override wins untouched; otherwise ask the registry.
-resolve_image() {
-  local repo="$1" override="$2" tag
+version_below() {
+  [ "$1" != "$2" ] \
+    && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -t. -k1,1V -k2,2n -k3,3n -k4,4n | head -1)" = "$1" ]
+}
+
+RESOLVED_IMAGE=""
+RESOLVED_ORIGIN=""
+resolve_or_die() {
+  local package="$1" requested="$2" override="$3" env_name="$4" flag="$5"
+  local tags tag
+
   if [ -n "$override" ]; then
-    printf '%s' "$override"
+    RESOLVED_IMAGE="$override"
+    RESOLVED_ORIGIN="pinned in the environment"
     return 0
   fi
-  tag="$(latest_tag "$repo" || true)"
-  [ -n "$tag" ] || return 1
-  printf '%s' "${REGISTRY_HOST}/${repo}:${tag}"
-}
 
-resolve_or_die() {
-  local repo="$1" override="$2" override_name="$3" resolved
-  if ! resolved="$(resolve_image "$repo" "$override")"; then
-    echo -e "${ICON_THUMBSDOWN} ${RED} Could not resolve a tag for ${repo} from ${REGISTRY}.${NC}" >&2
-    echo -e "${BLUE} Check the registry is reachable and your account can read ${repo},${NC}" >&2
-    echo -e "${BLUE} or pin a release explicitly: ${GREEN}export ${override_name}=${REGISTRY_HOST}/${repo}:<tag>${NC}" >&2
+  tags="$(registry_tags "$package" || true)"
+  if [ -z "$tags" ]; then
+    echo -e "${ICON_THUMBSDOWN} ${RED} Could not list published versions of ${package} on ${REGISTRY}.${NC}" >&2
+    echo -e "${BLUE} Check the registry is reachable and your account can read ${package},${NC}" >&2
+    echo -e "${BLUE} or name a full image explicitly: ${GREEN}export ${env_name}=${REGISTRY_HOST}/${package}:<tag>${NC}" >&2
     exit 1
   fi
-  printf '%s' "$resolved"
+
+  if [ -z "$requested" ] || [ "$requested" = "latest" ]; then
+    tag="$(printf '%s\n' "$tags" | tail -1)"
+    RESOLVED_ORIGIN="latest published"
+  else
+    # Published tags carry the v; the flag accepts the version with or without it.
+    tag="v${requested#v}"
+    if ! printf '%s\n' "$tags" | grep -qxF "$tag"; then
+      echo -e "${ICON_THUMBSDOWN} ${RED} ${package} has no published version ${tag}.${NC}" >&2
+      echo -e "${BLUE} Newest published versions of ${package}:${NC}" >&2
+      printf '%s\n' "$tags" | tail -5 | sed 's/^/   /' >&2
+      echo -e "${BLUE} Name one with ${GREEN}${flag} <version>${BLUE}, or take the newest with ${GREEN}${flag} latest${BLUE}.${NC}" >&2
+      exit 1
+    fi
+    RESOLVED_ORIGIN="requested"
+  fi
+
+  RESOLVED_IMAGE="${REGISTRY_HOST}/${package}:${tag}"
 }
 
+echo ""
 echo -e "${BLUE}Resolving image versions...${NC}"
-ADDMOBILEPORTAL_IMAGE="$(resolve_or_die "$PORTAL_REPO" "$ADDMOBILEPORTAL_IMAGE" SERVICE2_IMAGE)"
-MOBILESERVICES_IMAGE="$(resolve_or_die "$MOBILESERVICES_REPO" "$MOBILESERVICES_IMAGE" MOBILESERVICES_IMAGE)"
-echo -e "${ICON_THUMBSUP} ${GREEN} ${ADDMOBILEPORTAL_IMAGE}${NC}"
-echo -e "${ICON_THUMBSUP} ${GREEN} ${MOBILESERVICES_IMAGE}${NC}"
+
+resolve_or_die "$PORTAL_REPO" "$ADDMOBILEPORTAL_VERSION" "$ADDMOBILEPORTAL_IMAGE" ADDMOBILEPORTAL_IMAGE --add-mobileportal
+ADDMOBILEPORTAL_IMAGE="$RESOLVED_IMAGE"
+ADDMOBILEPORTAL_ORIGIN="$RESOLVED_ORIGIN"
+
+resolve_or_die "$MOBILESERVICES_REPO" "$MOBILESERVICES_VERSION" "$MOBILESERVICES_IMAGE" MOBILESERVICES_IMAGE --mobileservices
+MOBILESERVICES_IMAGE="$RESOLVED_IMAGE"
+MOBILESERVICES_ORIGIN="$RESOLVED_ORIGIN"
+
+printf "${ICON_THUMBSUP} ${GREEN} %-17s %s${NC} (%s)\n" "${PORTAL_REPO}" "${ADDMOBILEPORTAL_IMAGE}" "${ADDMOBILEPORTAL_ORIGIN}"
+printf "${ICON_THUMBSUP} ${GREEN} %-17s %s${NC} (%s)\n" "${MOBILESERVICES_REPO}" "${MOBILESERVICES_IMAGE}" "${MOBILESERVICES_ORIGIN}"
+
+# The gate config is read out of the add-mobileportal image further down, so a release that
+# predates that ability is refused here -- before anything is pulled or torn down -- rather
+# than at the render step, where the reason would be a shrug.
+PORTAL_TAG="${ADDMOBILEPORTAL_IMAGE##*:}"
+case "${PORTAL_TAG}" in
+  v[0-9]*)
+    if version_below "${PORTAL_TAG}" "${PORTAL_MIN_VERSION}"; then
+      echo -e "${ICON_THUMBSDOWN} ${RED} add-mobileportal ${PORTAL_TAG} is too old for this installer.${NC}" >&2
+      echo -e "${BLUE} The nginx gate config ships inside the image and is read out of it, which${NC}" >&2
+      echo -e "${BLUE} ${PORTAL_MIN_VERSION} is the first release to support. Install ${GREEN}--add-mobileportal latest${BLUE},${NC}" >&2
+      echo -e "${BLUE} or any version from ${PORTAL_MIN_VERSION} up.${NC}" >&2
+      exit 1
+    fi
+    ;;
+esac
 
 if [ -z "${MOBILEAPI_PORT}" ]; then
   echo -e "${ICON_TIP} ${BLUE} \nTip: Set the environment variable MOBILEAPI_PORT during login ${GREEN}(e.g. ~/.bashrc, ~/.cshrc, ~/.zshrc)${BLUE} so you don't have to enter it here.${NC}"
@@ -230,6 +347,10 @@ echo -e "${BLUE}Rendering nginx config (${CONF_DIR}/nginx.conf)...${NC}"
 if ! podman run --rm "${ADDMOBILEPORTAL_IMAGE}" --print-nginx-conf > "${CONF_DIR}/nginx.conf.template" 2>/dev/null \
    || [ ! -s "${CONF_DIR}/nginx.conf.template" ]; then
   echo -e "${ICON_THUMBSDOWN} ${RED} ${ADDMOBILEPORTAL_IMAGE} could not print its nginx template.${NC}" >&2
+  echo -e "${BLUE} Every release from ${PORTAL_MIN_VERSION} answers --print-nginx-conf. An image that does not${NC}" >&2
+  echo -e "${BLUE} is either older than that or not an add-mobileportal image at all -- check any${NC}" >&2
+  echo -e "${BLUE} ADDMOBILEPORTAL_IMAGE set in the environment, or install ${GREEN}--add-mobileportal latest${BLUE}.${NC}" >&2
+  echo -e "${BLUE} Nothing has been changed; the running pod, if any, is untouched.${NC}" >&2
   exit 1
 fi
 

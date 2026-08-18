@@ -9,6 +9,35 @@ Install: Run the following in bash
 $ bash -c "$(curl -fsSL https://raw.githubusercontent.com/addmobile/setup/refs/heads/main/setup.sh)"
 ```
 
+That installs the newest published version of both packages. It asks for your registry
+credentials, the host port and your gateway URL, then pulls the images and brings up the pod.
+
+### Choosing versions
+
+Two packages are installed from the registry, each named by its own flag:
+
+| Package | Flag | What it is |
+|---|---|---|
+| `add-mobileportal` | `--add-mobileportal <version>` | the API server |
+| `mobileservices` | `--mobileservices <version>` | the auth verify service every gated request is checked against |
+
+Anything not named is installed at its newest published version, which is also what
+`--latest` asks for explicitly:
+
+```
+# newest of both, stated outright
+$ curl -fsSL https://raw.githubusercontent.com/addmobile/setup/refs/heads/main/setup.sh | bash -s -- --latest
+
+# a specific release of one, newest of the other
+$ curl -fsSL https://raw.githubusercontent.com/addmobile/setup/refs/heads/main/setup.sh | bash -s -- --add-mobileportal v1.0.0.32
+
+# both pinned
+$ curl -fsSL .../setup.sh | bash -s -- --add-mobileportal v1.0.0.32 --mobileservices v0.0.16
+```
+
+Arguments go after the `--` when the script is piped from curl; without it they are read by
+`bash` rather than by the installer.
+
 ### You must put nginx in front of this
 
 The pod listens on plain HTTP and publishes one port. RavenLive and the driver devices are
@@ -36,14 +65,6 @@ GATEWAY_URL=<your gateway url>
 MOBILEAPI_PORT=<host port, default 8080>
 ```
 
-To install a specific release instead of the newest published one, export the image
-before running. `export` is required, not optional: on bare "assignment" the default
-installation commands get the latest build instead of the release pinned.
-```
-export SERVICE2_IMAGE=hub.addsys.com:33443/add-mobileportal:v1.0.0.32
-export MOBILESERVICES_IMAGE=hub.addsys.com:33443/mobileservices:v0.0.13
-```
-
 ## What it installs
 
 One podman pod (`mobile-pod`) with four containers: mongodb, mobileservices,
@@ -52,6 +73,10 @@ entrypoint and the auth gate for everything behind it.
 
 A fifth container, kafka, is **off by default**, saving ~1GB of memory and disk
 spent on retained events -- only created when `KAFKA_BROKERS` is set.
+
+There is no nginx config to write or keep in step: the installer asks the `add-mobileportal`
+image for the gate config that release was built with and fills in the two ports. Reinstalling
+at a different version brings that version's config with it.
 
 Health checks once it is up (replace 8080 with your port):
 ```
