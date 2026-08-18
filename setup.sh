@@ -25,10 +25,10 @@ ADDMOBILEPORTAL_IMAGE="${ADDMOBILEPORTAL_IMAGE:-${SERVICE2_IMAGE:-}}"
 NGINX_IMAGE="${NGINX_IMAGE:-docker.io/library/nginx:alpine}"
 
 # ---- Ports (in-pod, nginx ports) -----------------------------------------
-KAFKA_PORT="${KAFKA_PORT:-9092}"
 MOBILEAPI_PORT="${MOBILEAPI_PORT:-}"   # prompted below when unset; default 8080
 MOBILEAPI_BIND_HOST="${MOBILEAPI_BIND_HOST:-}"   # empty = all interfaces (see above)
-KAFKA_BROKERS="${KAFKA_BROKERS:-}"
+KAFKA_PORT="${KAFKA_PORT:-}"
+KAFKA_BROKERS=""
 MOBILESERVICES_PORT="${MOBILESERVICES_PORT:-8081}"
 ADDMOBILEPORTAL_PORT="${ADDMOBILEPORTAL_PORT:-${SERVICE2_PORT:-8082}}"
 MONGO_PORT_INTERNAL="27017"
@@ -346,6 +346,27 @@ if [ "${MOBILEAPI_PORT}" -lt 1024 ]; then
   echo -e "${ICON_WARN} ${YELLOW} Ports below 1024 need net.ipv4.ip_unprivileged_port_start lowered before rootless podman can bind them.${NC}" >&2
 fi
 
+if [ -n "${KAFKA_PORT}" ]; then
+  case "${KAFKA_PORT}" in
+    *[!0-9]*)
+      echo -e "${ICON_THUMBSDOWN} ${RED} KAFKA_PORT must be a number, got '${KAFKA_PORT}'.${NC}" >&2
+      echo -e "${BLUE} Leave it unset to run without Kafka, or give it a port, e.g. ${GREEN}KAFKA_PORT=9092${NC}" >&2
+      exit 2
+      ;;
+  esac
+  if [ "${KAFKA_PORT}" -lt 1 ] || [ "${KAFKA_PORT}" -gt 65535 ]; then
+    echo -e "${ICON_THUMBSDOWN} ${RED} KAFKA_PORT must be between 1 and 65535, got ${KAFKA_PORT}.${NC}" >&2
+    exit 2
+  fi
+  if [ "${KAFKA_PORT}" = "9093" ]; then
+    echo -e "${ICON_THUMBSDOWN} ${RED} KAFKA_PORT 9093 is reserved: the broker keeps it for its own controller listener.${NC}" >&2
+    echo -e "${BLUE} Pick another, e.g. ${GREEN}KAFKA_PORT=9092${NC}" >&2
+    exit 2
+  fi
+
+  KAFKA_BROKERS="127.0.0.1:${KAFKA_PORT}"
+fi
+
 echo -e "${YELLOW}------------------------------------ ENV -----------------------------------${NC}"
 echo -e "${YELLOW} MOBILEAPI_PORT ${NC}${MOBILEAPI_PORT}"
 echo -e "${YELLOW} GATEWAY_URL    ${NC}${GATEWAY_URL}"
@@ -363,13 +384,13 @@ fi
 
 prepare_data_dir "${CONF_DIR}"
 prepare_data_dir "${MONGODB_DIR}"
-if [ -n "${KAFKA_BROKERS}" ]; then
+if [ -n "${KAFKA_PORT}" ]; then
   prepare_data_dir "${KAFKA_DIR}"
 fi
 
 # ---- Pull every image before touching the running pod ------------------------
 PULL_IMAGES=("${ADDMOBILEPORTAL_IMAGE}" "${MOBILESERVICES_IMAGE}" "${MONGO_IMAGE}" "${NGINX_IMAGE}")
-[ -n "${KAFKA_BROKERS}" ] && PULL_IMAGES+=("${KAFKA_IMAGE}")
+[ -n "${KAFKA_PORT}" ] && PULL_IMAGES+=("${KAFKA_IMAGE}")
 
 echo ""
 echo -e "${BLUE}Pulling images...${NC}"
@@ -422,10 +443,10 @@ fi
 echo "Using volume suffix '$VOLUME_SUFFIX'"
 
 # ---- 2. Kafka (KRaft single-node mode, no ZooKeeper required; OFF by default) ----
-if [ -z "${KAFKA_BROKERS}" ]; then
-  echo ">> Kafka disabled (KAFKA_BROKERS empty) -- skipping the broker container."
+if [ -z "${KAFKA_PORT}" ]; then
+  echo ">> Kafka disabled (KAFKA_PORT empty) -- skipping the broker container."
 else
-echo ">> Starting kafka..."
+echo ">> Starting kafka on ${KAFKA_BROKERS}..."
 
 podman run -d \
   --pod "${POD_NAME}" \
@@ -437,10 +458,10 @@ podman run -d \
   --env KAFKA_NODE_ID=1 \
   --env KAFKA_PROCESS_ROLES=broker,controller \
   --env KAFKA_LISTENERS=PLAINTEXT://127.0.0.1:${KAFKA_PORT},CONTROLLER://127.0.0.1:9093 \
-  --env KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://kafka:${KAFKA_PORT} \
+  --env KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://${KAFKA_BROKERS} \
   --env KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER \
   --env KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT \
-  --env KAFKA_CONTROLLER_QUORUM_VOTERS=1@kafka:9093 \
+  --env KAFKA_CONTROLLER_QUORUM_VOTERS=1@127.0.0.1:9093 \
   --env KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1 \
   --env KAFKA_OFFSETS_TOPIC_NUM_PARTITIONS=1 \
   --env KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1 \
