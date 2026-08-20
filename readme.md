@@ -52,16 +52,37 @@ This removes the pod and leaves your data and rendered config in `~/ADD_MOBILE` 
 the pod *and* clean up its volumes, use the uninstall command below instead. The same `$0` caveat
 applies here -- `bash -c "$(curl ...)" down` would reinstall the pod rather than remove it.
 
+### Status
+
+```
+$ curl -fsSL https://raw.githubusercontent.com/addmobile/setup/refs/heads/main/setup.sh | bash -s -- status
+```
+
+Prints what is running, which versions, where the data lives, and whether all three services
+answer. It also confirms the auth gate is actually closed -- an unauthenticated request has to
+come back 401. The health endpoints alone cannot tell you that, because they are ungated by
+design.
+
 ### You must put nginx in front of this
 
-The pod listens on plain HTTP and publishes one port. RavenLive and the driver devices are
-HTTPS-only, so a host-level nginx terminating TLS for your hostname is **required** -- installer
-cannot do this for you.
+The pod listens on plain HTTP and publishes one port, on `127.0.0.1`. RavenLive and the driver
+devices are HTTPS-only, so a host-level nginx terminating TLS for your hostname is **required**
+-- the pod cannot do this for itself, because the certificate lives on your host.
 
-See **[host-nginx.md](host-nginx.md)** for a reference vhost and the five settings that must be
-right. Two of them (the WebSocket upgrade headers, and the upload size limit) fail silently if
-wrong: the app appears to work while the live map never updates, or occasional drivers disappear
-from the board with no error anywhere.
+```
+$ sudo ~/ADD_MOBILE/conf/host-nginx.sh \
+       --server-name raven.example.com --port 8080 \
+       --cert /etc/nginx/ssl/raven.example.com/fullchain.pem \
+       --key  /etc/nginx/ssl/raven.example.com/privkey.pem
+```
+
+Say no and nothing is written. Fetch the generator whenever you want it:
+
+```
+$ curl -fsSL https://raw.githubusercontent.com/addmobile/setup/refs/heads/main/host-nginx.sh \
+  | sudo bash -s -- --server-name raven.example.com --port 8080 \
+         --cert <fullchain.pem> --key <privkey.pem>
+```
 
 ## Uninstall
 
@@ -86,7 +107,10 @@ add-mobileportal and nginx. Only nginx is published on the host -- it is the
 entrypoint and the auth gate for everything behind it.
 
 A fifth container, kafka, is **off by default**, saving ~1GB of memory and disk
-spent on retained events -- only created when `KAFKA_BROKERS` is set.
+spent on retained events -- only created when `KAFKA_PORT` is set.
+
+It enables `podman-restart` and user lingering, so the pod comes back after a reboot rather
+than only after a crash.
 
 There is no nginx config to write or keep in step: the installer asks the `add-mobileportal`
 image for the gate config that release was built with and fills in the two ports. Reinstalling

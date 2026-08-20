@@ -14,8 +14,14 @@ esac
 PORTAL_REPO="add-mobileportal"
 MOBILESERVICES_REPO="mobileservices"
 SETUP_URL="https://raw.githubusercontent.com/addmobile/setup/refs/heads/main/setup.sh"
+HOST_NGINX_URL="https://raw.githubusercontent.com/addmobile/setup/refs/heads/main/host-nginx.sh"
 UNINSTALL_CMD='bash -c "$(curl -fsSL https://raw.githubusercontent.com/addmobile/setup/refs/heads/main/clear.sh)"'
 PORTAL_MIN_VERSION="v1.0.0.32"
+
+# Container uids the bind-mounted data directories have to be writable by. mongod is handed
+# to uid 999 by the image entrypoint; the kafka image runs as appuser.
+MONGO_UID="999"
+KAFKA_UID="1000"
 
 # ---- Images (override via env vars if you have your own) -----------------
 KAFKA_IMAGE="${KAFKA_IMAGE:-docker.io/apache/kafka:4.3.1}"
@@ -24,10 +30,13 @@ MOBILESERVICES_IMAGE="${MOBILESERVICES_IMAGE:-}"
 ADDMOBILEPORTAL_IMAGE="${ADDMOBILEPORTAL_IMAGE:-${SERVICE2_IMAGE:-}}"
 NGINX_IMAGE="${NGINX_IMAGE:-docker.io/library/nginx:alpine}"
 
-# ---- Ports (in-pod, nginx ports) -----------------------------------------
+# ---- Ports -------------------------------------------------------------------
+# Only MOBILEAPI_PORT is published. Every other port here is pod loopback, so those
+# numbers are internal and never have to be free on the host.
 MOBILEAPI_PORT="${MOBILEAPI_PORT:-}"   # prompted below when unset; default 8080
-MOBILEAPI_BIND_HOST="${MOBILEAPI_BIND_HOST:-}"   # empty = all interfaces (see above)
-KAFKA_PORT="${KAFKA_PORT:-}"
+MOBILEAPI_BIND_HOST="${MOBILEAPI_BIND_HOST:-127.0.0.1}"
+
+KAFKA_PORT="${KAFKA_PORT:-}"           # pod-internal; setting it is the on/off switch
 KAFKA_BROKERS=""
 MOBILESERVICES_PORT="${MOBILESERVICES_PORT:-8081}"
 ADDMOBILEPORTAL_PORT="${ADDMOBILEPORTAL_PORT:-${SERVICE2_PORT:-8082}}"
@@ -41,6 +50,7 @@ DATA_DIR="${BASE_DIR}/data"
 KAFKA_DIR="${DATA_DIR}/kafka"
 MONGODB_DIR="${DATA_DIR}/mongo"
 GATEWAY_URL="${GATEWAY_URL:-}"
+SERVER_NAME="${SERVER_NAME:-}"   # public hostname, used to render the host nginx vhost
 
 # ---- Icons ------------------------
 ICON_THUMBSUP="👍"
@@ -64,15 +74,29 @@ echo -e "\033[38;5;45m╚═╝  ╚═╝╚═════╝ ╚════�
 
 echo -e "${BLUE}ADD Systems, Inc.${NC}"
 
-# Bind-mounted data directories have to be writable by the container's user, which rootless
-# podman maps into the installing user's subuid range
-prepare_data_dir() {
+prepare_conf_dir() {
   local dir="$1"
   mkdir -p "$dir"
   if [ -O "$dir" ]; then
-    chmod 777 "$dir"
+    chmod 755 "$dir"
   else
     echo "   ${dir} already belongs to uid $(stat -c %u "$dir" 2>/dev/null) from an earlier install; leaving its permissions alone."
+  fi
+}
+
+prepare_data_dir() {
+  local dir="$1" uid="$2"
+  mkdir -p "$dir"
+
+  if [ ! -O "$dir" ]; then
+    echo "   ${dir} already belongs to uid $(stat -c %u "$dir" 2>/dev/null) from an earlier install; leaving its ownership alone."
+    return 0
+  fi
+
+  chmod 700 "$dir"
+  if ! podman unshare chown "${uid}:${uid}" "$dir" 2>/dev/null; then
+    echo -e "${ICON_WARN} ${YELLOW} Could not map ${dir} into the container user namespace; falling back to 0777.${NC}"
+    chmod 777 "$dir"
   fi
 }
 
@@ -84,6 +108,161 @@ teardown() {
   fi
 }
 
+POD_TOUCHED=0
+on_failure() {
+  local code=$?
+  [ "$code" -eq 0 ] && return 0
+  echo "" >&2
+  if [ "${POD_TOUCHED}" -eq 0 ]; then
+    echo -e "${ICON_THUMBSDOWN} ${RED} Install failed. The running pod, if there was one, is untouched.${NC}" >&2
+  else
+    echo -e "${ICON_THUMBSDOWN} ${RED} Install failed partway through building the pod -- '${POD_NAME}' is incomplete.${NC}" >&2
+    echo -e "${BLUE} Inspect it with ${GREEN}podman ps --pod${BLUE}, or clear it with:${NC}" >&2
+    echo -e "${GREEN}  ${UNINSTALL_CMD}${NC}" >&2
+  fi
+  return "$code"
+}
+
+wait_for_http() {
+  local _ code
+  for _ in $(seq 1 "${2:-30}"); do
+    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 "$1" || echo 000)"
+    case "${code}" in
+      2??) return 0 ;;
+    esac
+    sleep 1
+  done
+  return 1
+}
+
+gate_state() {
+  local url="$1" response code body
+  response="$(curl -s -w '\n%{http_code}' --max-time 5 "${url}" 2>/dev/null || printf '\n000')"
+  code="${response##*$'\n'}"
+  body="${response%$'\n'*}"
+
+  case "${code}" in
+    401)
+      case "${body}" in
+        *ADD_GATEWAY_UNAUTHORIZED*) echo "closed" ;;
+        *)                          echo "closed-unmarked" ;;
+      esac
+      ;;
+    503) echo "unavailable" ;;
+    2??) echo "open" ;;
+    500)
+      case "${body}" in
+        *GATE_NOT_CONFIGURED*) echo "ungated" ;;
+        *)                     echo "inconclusive:${code}" ;;
+      esac
+      ;;
+    *)   echo "inconclusive:${code}" ;;
+  esac
+}
+
+report_gate() {
+  local label="$1" url="$2" what="$3" state
+  state="$(gate_state "${url}")"
+  case "${state}" in
+    closed)
+      echo -e "${ICON_THUMBSUP} ${GREEN} ${label} closed (unauthenticated requests refused)${NC}"
+      ;;
+    closed-unmarked)
+      echo -e "${ICON_WARN} ${YELLOW} ${label} refused the request, but not with the gate's own 401.${NC}"
+      echo -e "${BLUE} Something in front of nginx may be answering first. Requests are still refused.${NC}"
+      ;;
+    open)
+      echo -e "${ICON_THUMBSDOWN} ${RED} THE ${label} IS OPEN -- an unauthenticated request was answered, not refused.${NC}"
+      echo -e "${BLUE} ${what}${NC}"
+      echo -e "${BLUE} Check: podman logs nginx, and ${CONF_DIR}/nginx.conf${NC}"
+      DEGRADED=1
+      ;;
+    ungated)
+      echo -e "${ICON_THUMBSDOWN} ${RED} ${label} is not wired up -- nginx is not stamping the caller's identity.${NC}"
+      echo -e "${BLUE} The API is refusing every request rather than serving them, so nothing is exposed,${NC}"
+      echo -e "${BLUE} but nothing works either. The fault is in the proxy, not the application.${NC}"
+      echo -e "${BLUE} Check: ${CONF_DIR}/nginx.conf, and podman logs nginx${NC}"
+      DEGRADED=1
+      ;;
+    unavailable)
+      echo -e "${ICON_WARN} ${YELLOW} ${label} is enforcing but could not reach ADD Security (503).${NC}"
+      echo -e "${BLUE} Requests are being refused, so nothing is exposed -- but nothing works either.${NC}"
+      echo -e "${BLUE} Check GATEWAY_URL and: podman logs mobileservices${NC}"
+      DEGRADED=1
+      ;;
+    *)
+      echo -e "${ICON_WARN} ${YELLOW} ${label} answered ${state#inconclusive:}; could not confirm it is closed.${NC}"
+      DEGRADED=1
+      ;;
+  esac
+}
+
+# Shared by the post-install checks and the `status` subcommand so the two can never drift.
+# Sets DEGRADED when anything is wrong.
+DEGRADED=0
+check_endpoints() {
+  local host="$1" port="$2" tries="${3:-1}"
+  local base="http://${host}:${port}"
+
+  if wait_for_http "${base}/health" "${tries}"; then
+    echo -e "${ICON_THUMBSUP} ${GREEN} nginx up${NC}"
+  else
+    echo -e "${ICON_THUMBSDOWN} ${RED} nginx is not answering on ${port}. Check: podman logs nginx${NC}"
+    DEGRADED=1
+  fi
+  if wait_for_http "${base}/ms/health" "${tries}"; then
+    echo -e "${ICON_THUMBSUP} ${GREEN} auth verify up${NC}"
+  else
+    echo -e "${ICON_THUMBSDOWN} ${RED} auth verify is not answering; every authenticated request would fail. Check: podman logs mobileservices${NC}"
+    DEGRADED=1
+  fi
+  if wait_for_http "${base}/amp/health" "${tries}"; then
+    echo -e "${ICON_THUMBSUP} ${GREEN} add-mobileportal up${NC}"
+  else
+    echo -e "${ICON_THUMBSDOWN} ${RED} add-mobileportal is not answering. Check: podman logs add-mobileportal${NC}"
+    DEGRADED=1
+  fi
+
+  report_gate "gate" "${base}/user" \
+    "The API performs no authentication of its own, so everything behind nginx is open."
+  report_gate "socket gate" "${base}/socket.io/?EIO=4&transport=polling" \
+    "Live driver positions would be readable without a credential."
+}
+
+status_report() {
+  if ! podman pod exists "${POD_NAME}"; then
+    echo "Pod '${POD_NAME}' does not exist."
+    return 1
+  fi
+
+  echo -e "${YELLOW}---------------------------------- CONTAINERS ------------------------------${NC}"
+  podman ps --pod --filter "pod=${POD_NAME}" \
+    --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}'
+
+  local published=""
+  published="$(podman pod inspect "${POD_NAME}" \
+    --format '{{range (index . 0).InfraConfig.PortBindings}}{{range .}}{{.HostIP}}:{{.HostPort}}{{end}}{{end}}' 2>/dev/null)" \
+    || published=""
+  if [ -z "${published}" ]; then
+    published="$(podman pod inspect "${POD_NAME}" \
+      --format '{{range .InfraConfig.PortBindings}}{{range .}}{{.HostIP}}:{{.HostPort}}{{end}}{{end}}' 2>/dev/null)" \
+      || published=""
+  fi
+  published="${published:-unknown}"
+  echo ""
+  echo -e "${YELLOW} published    ${NC}${published} -> nginx:80"
+  echo -e "${YELLOW} data         ${NC}${DATA_DIR}"
+  echo -e "${YELLOW} config       ${NC}${CONF_DIR}"
+
+  local host="${published%:*}" port="${published##*:}"
+  case "${host}" in ''|unknown|0.0.0.0|'[::]') host="127.0.0.1" ;; esac
+  case "${port}" in ''|unknown) return 0 ;; esac
+
+  echo ""
+  echo -e "${YELLOW}------------------------------------ HEALTH --------------------------------${NC}"
+  check_endpoints "${host}" "${port}"
+}
+
 # ---- Arguments ---------------------------------------------------------------
 ADDMOBILEPORTAL_VERSION=""
 MOBILESERVICES_VERSION=""
@@ -91,6 +270,7 @@ MOBILESERVICES_VERSION=""
 usage() {
   cat <<EOF
 Usage: setup.sh [--add-mobileportal <version>] [--mobileservices <version>] [--latest]
+       setup.sh status
        setup.sh down
 
 Packages:
@@ -101,8 +281,17 @@ Options:
   --add-mobileportal <version>   install this version of add-mobileportal
   --mobileservices <version>     install this version of mobileservices
   --latest                       install the newest published version of both (the default)
+  status                         report what is running, and whether the gate is closed
   down                           remove the pod and exit
   -h, --help                     show this message
+
+Environment (set these in your shell profile to skip the prompts):
+  MOBILEAPI_PORT        host port nginx is published on          (default 8080)
+  MOBILEAPI_BIND_HOST   address that port binds to               (default 127.0.0.1)
+  GATEWAY_URL           ADD Security gateway, used for auth
+  SERVER_NAME           public hostname; setting it renders the host nginx vhost
+                        for that name without asking
+  KAFKA_PORT            pod-internal port; setting it enables the broker
 
 Running straight from the installer URL, arguments go after a "--":
   curl -fsSL ${SETUP_URL} | bash -s -- --add-mobileportal v1.0.0.32
@@ -123,6 +312,11 @@ while [ $# -gt 0 ]; do
   case "$1" in
     down)
       teardown
+      exit 0
+      ;;
+    status)
+      status_report || exit 1
+      [ "${DEGRADED}" -eq 0 ] || exit 1
       exit 0
       ;;
     --latest)
@@ -161,6 +355,8 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+trap on_failure EXIT
+
 # ---- Host prerequisites ------------------------------------------------------
 for tool in podman curl loginctl; do
   if ! command -v "$tool" >/dev/null 2>&1; then
@@ -172,7 +368,8 @@ done
 
 MAX_MAP_COUNT="$(cat /proc/sys/vm/max_map_count 2>/dev/null || echo 0)"
 if [ "${MAX_MAP_COUNT}" -lt 262144 ] 2>/dev/null; then
-  echo -e "${BLUE}Note: vm.max_map_count is ${MAX_MAP_COUNT}. Raising it is recommended for a long-running pod:${NC}"
+  echo -e "${BLUE}Note: vm.max_map_count is ${MAX_MAP_COUNT}. The API accumulates memory mappings over long${NC}"
+  echo -e "${BLUE}uptimes and stalls on reaching that ceiling; raising it avoids the restart:${NC}"
   echo -e "${GREEN}  echo 'vm.max_map_count=262144' | sudo tee /etc/sysctl.d/99-addmobile.conf && sudo sysctl --system${NC}"
   echo ""
 fi
@@ -183,6 +380,150 @@ if ! podman info >/dev/null 2>&1; then
   exit 1
 fi
 
+# Running out mid-pull leaves a partial layer and an error that reads like a network fault.
+GRAPH_ROOT="$(podman info --format '{{.Store.GraphRoot}}' 2>/dev/null || echo "${HOME}")"
+FREE_MB="$(df -Pm "${GRAPH_ROOT}" 2>/dev/null | awk 'NR==2{print $4}')"
+if [ -n "${FREE_MB}" ] && [ "${FREE_MB}" -lt 2048 ] 2>/dev/null; then
+  echo -e "${ICON_WARN} ${YELLOW} Only ${FREE_MB} MB free on ${GRAPH_ROOT}. More than 2 GB is recommended.${NC}"
+  echo ""
+fi
+
+# ---- Everything the install needs from the operator ---------------------------
+if [ -z "${MOBILEAPI_PORT}" ]; then
+  echo -e "${ICON_TIP} ${BLUE} \nTip: Set the environment variable MOBILEAPI_PORT during login ${GREEN}(e.g. ~/.bashrc, ~/.cshrc, ~/.zshrc)${BLUE} so you don't have to enter it here.${NC}"
+  echo ""
+  read -r -p "PORT (default: 8080): " MOBILEAPI_PORT < /dev/tty
+  MOBILEAPI_PORT="${MOBILEAPI_PORT:-8080}"
+  echo ""
+fi
+
+case "${MOBILEAPI_PORT}" in
+  ''|*[!0-9]*)
+    echo -e "${ICON_THUMBSDOWN} ${RED} MOBILEAPI_PORT must be a number, got '${MOBILEAPI_PORT}'.${NC}" >&2
+    exit 2
+    ;;
+esac
+if [ "${MOBILEAPI_PORT}" -lt 1 ] || [ "${MOBILEAPI_PORT}" -gt 65535 ]; then
+  echo -e "${ICON_THUMBSDOWN} ${RED} MOBILEAPI_PORT must be between 1 and 65535, got ${MOBILEAPI_PORT}.${NC}" >&2
+  exit 2
+fi
+if [ "${MOBILEAPI_PORT}" -lt 1024 ]; then
+  echo -e "${ICON_WARN} ${YELLOW} Ports below 1024 need net.ipv4.ip_unprivileged_port_start lowered before rootless podman can bind them.${NC}" >&2
+fi
+
+port_in_use() {
+  local port="$1"
+  if command -v ss >/dev/null 2>&1; then
+    [ -n "$(ss -Hltn "sport = :${port}" 2>/dev/null)" ] && return 0
+  elif command -v netstat >/dev/null 2>&1; then
+    netstat -ltn 2>/dev/null | awk -v p=":${port}$" '$4 ~ p {found=1} END{exit !found}' && return 0
+  fi
+  return 1
+}
+if ! podman pod exists "${POD_NAME}" && port_in_use "${MOBILEAPI_PORT}"; then
+  echo -e "${ICON_THUMBSDOWN} ${RED} Port ${MOBILEAPI_PORT} is already in use by something else on this host.${NC}" >&2
+  echo -e "${BLUE} Free it, or pick another with ${GREEN}MOBILEAPI_PORT=<port>${BLUE}. Listening now:${NC}" >&2
+  (ss -ltnp "sport = :${MOBILEAPI_PORT}" 2>/dev/null || netstat -ltnp 2>/dev/null) | sed 's/^/   /' >&2
+  exit 2
+fi
+
+if [ -z "${GATEWAY_URL}" ]; then
+  echo ""
+  echo -e "${ICON_WARN} ${YELLOW} GATEWAY_URL is not set.${NC}"
+  echo ""
+  echo -e "${ICON_TIP} ${BLUE} Tip: Set the environment variable GATEWAY_URL during login ${GREEN}(e.g. ~/.bashrc, ~/.cshrc, ~/.zshrc)${BLUE} so you don't have to enter it here.${NC}"
+  echo ""
+  read -r -p "Enter GATEWAY_URL (i.e. https://<gateway>.<yourdomain>:39079): " GATEWAY_URL < /dev/tty
+fi
+
+case "${GATEWAY_URL}" in
+  http://*|https://*) ;;
+  '')
+    echo -e "${ICON_THUMBSDOWN} ${RED} GATEWAY_URL is required.${NC}" >&2
+    exit 2
+    ;;
+  *)
+    echo -e "${ICON_THUMBSDOWN} ${RED} GATEWAY_URL needs a scheme, got '${GATEWAY_URL}'.${NC}" >&2
+    echo -e "${BLUE} For example: ${GREEN}https://${GATEWAY_URL}${NC}" >&2
+    exit 2
+    ;;
+esac
+
+if [ -n "${KAFKA_PORT}" ]; then
+  case "${KAFKA_PORT}" in
+    *[!0-9]*)
+      echo -e "${ICON_THUMBSDOWN} ${RED} KAFKA_PORT must be a number, got '${KAFKA_PORT}'.${NC}" >&2
+      echo -e "${BLUE} Leave it unset to run without Kafka, or give it a port, e.g. ${GREEN}KAFKA_PORT=9092${NC}" >&2
+      exit 2
+      ;;
+  esac
+  if [ "${KAFKA_PORT}" -lt 1 ] || [ "${KAFKA_PORT}" -gt 65535 ]; then
+    echo -e "${ICON_THUMBSDOWN} ${RED} KAFKA_PORT must be between 1 and 65535, got ${KAFKA_PORT}.${NC}" >&2
+    exit 2
+  fi
+  if [ "${KAFKA_PORT}" = "9093" ]; then
+    echo -e "${ICON_THUMBSDOWN} ${RED} KAFKA_PORT 9093 is reserved: the broker keeps it for its own controller listener.${NC}" >&2
+    echo -e "${BLUE} Pick another, e.g. ${GREEN}KAFKA_PORT=9092${NC}" >&2
+    exit 2
+  fi
+
+  KAFKA_BROKERS="127.0.0.1:${KAFKA_PORT}"
+fi
+
+# ---- Host nginx vhost: offered, never assumed --------------------------------
+# The pod cannot terminate TLS, so a host nginx in front of it is required either way, and
+# everything needed to write that vhost is already known here
+HOST_NGINX_WANTED=""
+
+if [ -n "${SERVER_NAME}" ]; then
+  HOST_NGINX_WANTED=1
+elif [ -e /dev/tty ]; then
+  SERVER_NAME_DEFAULT="$(hostname -f 2>/dev/null || hostname 2>/dev/null || echo '')"
+  SERVER_NAME_DEFAULT="${SERVER_NAME_DEFAULT:-raven.example.com}"
+
+  echo ""
+  echo -e "${BLUE}The pod speaks plain HTTP. RavenLive and the driver devices are HTTPS-only, so an${NC}"
+  echo -e "${BLUE}nginx on this host terminating TLS is required in front of it.${NC}"
+  echo ""
+
+  if [ -f "${CONF_DIR}/${SERVER_NAME_DEFAULT}.conf" ]; then
+    echo -e "${ICON_TIP} ${BLUE} A vhost for ${GREEN}${SERVER_NAME_DEFAULT}${BLUE} already exists in ${CONF_DIR}.${NC}"
+    echo -e "${BLUE} Regenerating replaces it, keeping the current one as a .bak file.${NC}"
+    read -r -p "Regenerate it? [y/N]: " HOST_NGINX_ANSWER < /dev/tty
+    case "${HOST_NGINX_ANSWER}" in [Yy]*) HOST_NGINX_WANTED=1 ;; esac
+  else
+    read -r -p "Write one for this host? [Y/n]: " HOST_NGINX_ANSWER < /dev/tty
+    case "${HOST_NGINX_ANSWER}" in [Nn]*) ;; *) HOST_NGINX_WANTED=1 ;; esac
+  fi
+
+  if [ -n "${HOST_NGINX_WANTED}" ]; then
+    read -r -p "Public hostname [${SERVER_NAME_DEFAULT}]: " SERVER_NAME < /dev/tty
+    SERVER_NAME="${SERVER_NAME:-${SERVER_NAME_DEFAULT}}"
+  fi
+  echo ""
+fi
+
+echo -e "${YELLOW}------------------------------------ ENV -----------------------------------${NC}"
+echo -e "${YELLOW} MOBILEAPI_PORT ${NC}${MOBILEAPI_BIND_HOST}:${MOBILEAPI_PORT}"
+echo -e "${YELLOW} GATEWAY_URL    ${NC}${GATEWAY_URL}"
+if [ -n "${HOST_NGINX_WANTED}" ]; then
+  echo -e "${YELLOW} HOST NGINX     ${NC}vhost for ${SERVER_NAME}"
+else
+  echo -e "${YELLOW} HOST NGINX     ${NC}not generated"
+fi
+echo -e "${YELLOW}------------------------------------ ENV -----------------------------------${NC}"
+
+DISCOVERY_URL="${GATEWAY_URL%/}/.well-known/openid-configuration"
+STATUS_CODE="$(curl -s -o /dev/null -w "%{http_code}" "${DISCOVERY_URL}" || echo "000")"
+
+if [ "$STATUS_CODE" = "200" ]; then
+    echo -e "${ICON_THUMBSUP} ${GREEN} Success:${DISCOVERY_URL} returned HTTP 200 ${NC}"
+else
+    echo -e "${ICON_THUMBSDOWN} ${RED} Failed:${DISCOVERY_URL} returned HTTP ${STATUS_CODE} ${NC}"
+    exit 1
+fi
+
+echo ""
 echo -e "${BLUE}Login to ${REGISTRY_HOST}${NC}"
 
 read -r -p "Username: " USERNAME < /dev/tty
@@ -315,77 +656,10 @@ case "${PORTAL_TAG}" in
     ;;
 esac
 
-if [ -z "${MOBILEAPI_PORT}" ]; then
-  echo -e "${ICON_TIP} ${BLUE} \nTip: Set the environment variable MOBILEAPI_PORT during login ${GREEN}(e.g. ~/.bashrc, ~/.cshrc, ~/.zshrc)${BLUE} so you don't have to enter it here.${NC}"
-  echo ""
-  read -r -p "PORT (default: 8080): " MOBILEAPI_PORT < /dev/tty
-  MOBILEAPI_PORT="${MOBILEAPI_PORT:-8080}"
-  echo ""
-fi
-
-if [ -z "${GATEWAY_URL}" ]; then
-  echo ""
-  echo -e "${ICON_WARN} ${YELLOW} GATEWAY_URL is not set.${NC}"
-  echo ""
-  echo -e "${ICON_TIP} ${BLUE} Tip: Set the environment variable GATEWAY_URL during login ${GREEN}(e.g. ~/.bashrc, ~/.cshrc, ~/.zshrc)${BLUE} so you don't have to enter it here.${NC}"
-  echo ""
-  read -r -p "Enter GATEWAY_URL (i.e. https://<gateway>.<yourdomain>:39079): " GATEWAY_URL < /dev/tty
-fi
-
-case "${MOBILEAPI_PORT}" in
-  ''|*[!0-9]*)
-    echo -e "${ICON_THUMBSDOWN} ${RED} MOBILEAPI_PORT must be a number, got '${MOBILEAPI_PORT}'.${NC}" >&2
-    exit 2
-    ;;
-esac
-if [ "${MOBILEAPI_PORT}" -lt 1 ] || [ "${MOBILEAPI_PORT}" -gt 65535 ]; then
-  echo -e "${ICON_THUMBSDOWN} ${RED} MOBILEAPI_PORT must be between 1 and 65535, got ${MOBILEAPI_PORT}.${NC}" >&2
-  exit 2
-fi
-if [ "${MOBILEAPI_PORT}" -lt 1024 ]; then
-  echo -e "${ICON_WARN} ${YELLOW} Ports below 1024 need net.ipv4.ip_unprivileged_port_start lowered before rootless podman can bind them.${NC}" >&2
-fi
-
+prepare_conf_dir "${CONF_DIR}"
+prepare_data_dir "${MONGODB_DIR}" "${MONGO_UID}"
 if [ -n "${KAFKA_PORT}" ]; then
-  case "${KAFKA_PORT}" in
-    *[!0-9]*)
-      echo -e "${ICON_THUMBSDOWN} ${RED} KAFKA_PORT must be a number, got '${KAFKA_PORT}'.${NC}" >&2
-      echo -e "${BLUE} Leave it unset to run without Kafka, or give it a port, e.g. ${GREEN}KAFKA_PORT=9092${NC}" >&2
-      exit 2
-      ;;
-  esac
-  if [ "${KAFKA_PORT}" -lt 1 ] || [ "${KAFKA_PORT}" -gt 65535 ]; then
-    echo -e "${ICON_THUMBSDOWN} ${RED} KAFKA_PORT must be between 1 and 65535, got ${KAFKA_PORT}.${NC}" >&2
-    exit 2
-  fi
-  if [ "${KAFKA_PORT}" = "9093" ]; then
-    echo -e "${ICON_THUMBSDOWN} ${RED} KAFKA_PORT 9093 is reserved: the broker keeps it for its own controller listener.${NC}" >&2
-    echo -e "${BLUE} Pick another, e.g. ${GREEN}KAFKA_PORT=9092${NC}" >&2
-    exit 2
-  fi
-
-  KAFKA_BROKERS="127.0.0.1:${KAFKA_PORT}"
-fi
-
-echo -e "${YELLOW}------------------------------------ ENV -----------------------------------${NC}"
-echo -e "${YELLOW} MOBILEAPI_PORT ${NC}${MOBILEAPI_PORT}"
-echo -e "${YELLOW} GATEWAY_URL    ${NC}${GATEWAY_URL}"
-echo -e "${YELLOW}------------------------------------ ENV -----------------------------------${NC}"
-
-DISCOVERY_URL="${GATEWAY_URL%/}/.well-known/openid-configuration"
-STATUS_CODE="$(curl -s -o /dev/null -w "%{http_code}" "${DISCOVERY_URL}" || echo "000")"
-
-if [ "$STATUS_CODE" = "200" ]; then
-    echo -e "${ICON_THUMBSUP} ${GREEN} Success:${DISCOVERY_URL} returned HTTP 200 ${NC}"
-else
-    echo -e "${ICON_THUMBSDOWN} ${RED} Failed:${DISCOVERY_URL} returned HTTP ${STATUS_CODE} ${NC}"
-    exit 1
-fi
-
-prepare_data_dir "${CONF_DIR}"
-prepare_data_dir "${MONGODB_DIR}"
-if [ -n "${KAFKA_PORT}" ]; then
-  prepare_data_dir "${KAFKA_DIR}"
+  prepare_data_dir "${KAFKA_DIR}" "${KAFKA_UID}"
 fi
 
 # ---- Pull every image before touching the running pod ------------------------
@@ -406,6 +680,25 @@ for image in "${PULL_IMAGES[@]}"; do
   fi
 done
 
+# ---- Which images can be restarted on a failing health check -----------------
+image_has_healthcheck() {
+  [ -n "$(podman image inspect "$1" \
+      --format '{{if .HealthCheck}}{{range .HealthCheck.Test}}{{.}}{{end}}{{end}}' 2>/dev/null)" ]
+}
+
+PORTAL_HEALTH_KILL=""
+MOBILESERVICES_HEALTH_KILL=""
+image_has_healthcheck "${ADDMOBILEPORTAL_IMAGE}" && PORTAL_HEALTH_KILL=1
+image_has_healthcheck "${MOBILESERVICES_IMAGE}"  && MOBILESERVICES_HEALTH_KILL=1
+
+if [ -z "${PORTAL_HEALTH_KILL}" ] || [ -z "${MOBILESERVICES_HEALTH_KILL}" ]; then
+  echo ""
+  echo -e "${ICON_WARN} ${YELLOW} These images declare no health check, so a wedged process will not be restarted:${NC}"
+  [ -z "${PORTAL_HEALTH_KILL}" ]         && echo -e "${BLUE}   ${ADDMOBILEPORTAL_IMAGE}${NC}"
+  [ -z "${MOBILESERVICES_HEALTH_KILL}" ] && echo -e "${BLUE}   ${MOBILESERVICES_IMAGE}${NC}"
+  echo -e "${BLUE} They still run, and a crash is still restarted. A newer release adds the check.${NC}"
+fi
+
 # ---- nginx config ------------------------------------------------------------
 echo ""
 echo -e "${BLUE}Rendering nginx config (${CONF_DIR}/nginx.conf)...${NC}"
@@ -425,7 +718,10 @@ sed -e "s|__ADDMOBILEPORTAL_PORT__|${ADDMOBILEPORTAL_PORT}|g" \
     "${CONF_DIR}/nginx.conf.template" > "${CONF_DIR}/nginx.conf.new"
 mv "${CONF_DIR}/nginx.conf.new" "${CONF_DIR}/nginx.conf"
 rm -f "${CONF_DIR}/nginx.conf.template"
+chmod 644 "${CONF_DIR}/nginx.conf"
 
+# Past this point a failure leaves a half-built pod rather than the previous one.
+POD_TOUCHED=1
 teardown
 
 # ---- 1. Create the pod ------------------------------------------------------
@@ -452,6 +748,7 @@ podman run -d \
   --pod "${POD_NAME}" \
   --name kafka \
   --restart always \
+  --stop-timeout 30 \
   --memory 1g --memory-swap 1g \
   --volume "${KAFKA_DIR}:/var/lib/kafka/data${VOLUME_SUFFIX}" \
   --env KAFKA_LOG_DIRS=/var/lib/kafka/data \
@@ -484,6 +781,12 @@ podman run -d \
   --memory 768m --memory-swap 768m \
   --volume "${MONGODB_DIR}:/data/db${VOLUME_SUFFIX}" \
   --volume mongo-configdb:/data/configdb \
+  --health-cmd "mongosh --quiet --eval 'db.runCommand({ping:1}).ok' || exit 1" \
+  --health-interval 30s \
+  --health-retries 5 \
+  --health-start-period 120s \
+  --health-on-failure=kill \
+  --stop-timeout 60 \
   "${MONGO_IMAGE}" \
   --bind_ip_all \
   --quiet \
@@ -518,6 +821,7 @@ podman run -d \
   --pod "${POD_NAME}" \
   --name mobileservices \
   --restart always \
+  ${MOBILESERVICES_HEALTH_KILL:+--health-on-failure=kill} \
   --memory 512m --memory-swap 512m \
   "${MOBILESERVICES_ENV_FLAGS[@]}" \
   "${MOBILESERVICES_IMAGE}"
@@ -528,7 +832,7 @@ podman run -d \
   --pod "${POD_NAME}" \
   --name add-mobileportal \
   --restart always \
-  --health-on-failure=kill \
+  ${PORTAL_HEALTH_KILL:+--health-on-failure=kill} \
   --memory 1g --memory-swap 1g \
   -e API_PORT="${ADDMOBILEPORTAL_PORT}" \
   -e MONGO_URL="mongodb://127.0.0.1:${MONGO_PORT_INTERNAL}" \
@@ -546,61 +850,56 @@ podman run -d \
   --name nginx \
   --restart always \
   -v "${CONF_DIR}/nginx.conf:/etc/nginx/nginx.conf:ro${VOLUME_SUFFIX}" \
+  --health-cmd "wget -q -O /dev/null http://127.0.0.1:80/health || exit 1" \
+  --health-interval 30s \
+  --health-retries 3 \
+  --health-start-period 10s \
+  --health-on-failure=kill \
   "${NGINX_IMAGE}"
 
 # ---- 7. Prove the stack answers before declaring success --------------------
-wait_for_http() {
-  local _ code
-  for _ in $(seq 1 30); do
-    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 "$1" || echo 000)"
-    case "${code}" in
-      2??) return 0 ;;
-    esac
-    sleep 1
-  done
-  return 1
-}
-
 echo ""
-DEGRADED=0
-if wait_for_http "http://127.0.0.1:${MOBILEAPI_PORT}/health"; then
-  echo -e "${ICON_THUMBSUP} ${GREEN} nginx up${NC}"
-else
-  echo -e "${ICON_THUMBSDOWN} ${RED} nginx is not answering on ${MOBILEAPI_PORT}. Check: podman logs nginx${NC}"
-  DEGRADED=1
-fi
-if wait_for_http "http://127.0.0.1:${MOBILEAPI_PORT}/ms/health"; then
-  echo -e "${ICON_THUMBSUP} ${GREEN} auth verify up${NC}"
-else
-  echo -e "${ICON_THUMBSDOWN} ${RED} auth verify is not answering; every authenticated request would fail. Check: podman logs mobileservices${NC}"
-  DEGRADED=1
-fi
-if wait_for_http "http://127.0.0.1:${MOBILEAPI_PORT}/amp/health"; then
-  echo -e "${ICON_THUMBSUP} ${GREEN} add-mobileportal up${NC}"
-else
-  echo -e "${ICON_THUMBSDOWN} ${RED} add-mobileportal is not answering. Check: podman logs add-mobileportal${NC}"
-  DEGRADED=1
-fi
+check_endpoints "127.0.0.1" "${MOBILEAPI_PORT}" 30
 
 echo -e ">> Pod status:${GREEN}"
 podman pod ps
 podman ps --pod
 echo -e "${NC}"
 
-# Rootless --restart=always containers only survive logout and reboot with linger on
-# and the podman-restart user service enabled.
-LINGER="$(loginctl show-user "$USER" --property=Linger --value 2>/dev/null || echo unknown)"
-if [ "$LINGER" != "yes" ]; then
-  if loginctl enable-linger "$USER" 2>/dev/null; then
-    echo -e "${GREEN}Linger enabled for $USER.${NC}"
-  else
-    echo -e "${ICON_WARN} ${YELLOW} Linger is OFF and could not be enabled -- the pod will die on logout/reboot.${NC}"
-    echo -e "${BLUE} Run: ${GREEN}sudo loginctl enable-linger $USER${NC}"
-  fi
-fi
-systemctl --user enable podman-restart.service >/dev/null 2>&1 \
-  || echo -e "${ICON_WARN} ${YELLOW} Could not enable podman-restart.service; containers will not come back after a reboot.${NC}"
+# ---- 8. Survive a reboot -----------------------------------------------------
+enable_reboot_persistence() {
+  local err linger
 
+  linger="$(loginctl show-user "$USER" --property=Linger --value 2>/dev/null || echo unknown)"
+  if [ "$linger" != "yes" ]; then
+    if loginctl enable-linger "$USER" 2>/dev/null; then
+      echo -e "${GREEN}Linger enabled for $USER.${NC}"
+    else
+      echo -e "${ICON_WARN} ${YELLOW} Linger is OFF and could not be enabled -- the pod will die on logout/reboot.${NC}"
+      echo -e "${BLUE} Run: ${GREEN}sudo loginctl enable-linger $USER${NC}"
+    fi
+  fi
+
+  systemctl --user is-system-running >/dev/null 2>&1 || sleep 2
+
+  if err="$(systemctl --user enable podman-restart.service 2>&1)" \
+     && systemctl --user is-enabled podman-restart.service >/dev/null 2>&1; then
+    echo -e "${ICON_THUMBSUP} ${GREEN} podman-restart enabled -- the pod comes back after a reboot.${NC}"
+    return 0
+  fi
+
+  echo -e "${ICON_WARN} ${YELLOW} Could not enable podman-restart.service; containers will not come back after a reboot.${NC}"
+  if [ -n "${err}" ]; then
+    echo -e "${BLUE} systemd said:${NC}"
+    printf '%s\n' "${err}" | sed 's/^/   /'
+  fi
+  echo -e "${BLUE} Fix it from a login shell on this host with:${NC}"
+  echo -e "${GREEN}  systemctl --user enable --now podman-restart.service${NC}"
+  return 1
+}
+enable_reboot_persistence || true
+
+podman logout "${REGISTRY_HOST}" >/dev/null 2>&1 || true
 unset PASSWORD USERNAME
 
 if [ "$DEGRADED" -ne 0 ]; then
@@ -612,14 +911,72 @@ if [ "$DEGRADED" -ne 0 ]; then
   exit 1
 fi
 
-echo -e "\n${BLUE}Listening to http://127.0.0.1:${MOBILEAPI_PORT}${NC}"
+# ---- 9. Render the host nginx vhost -----------------------------------------
+HOST_NGINX_READY=0
+if [ -n "${HOST_NGINX_WANTED}" ]; then
+  if curl -fsSL "${HOST_NGINX_URL}" -o "${CONF_DIR}/host-nginx.sh" 2>/dev/null \
+     && [ -s "${CONF_DIR}/host-nginx.sh" ]; then
+    chmod 755 "${CONF_DIR}/host-nginx.sh"
+    if bash "${CONF_DIR}/host-nginx.sh" --render \
+         --server-name "${SERVER_NAME}" \
+         --port "${MOBILEAPI_PORT}" \
+         --out-dir "${CONF_DIR}" >/dev/null 2>&1; then
+      HOST_NGINX_READY=1
+    fi
+  fi
+fi
+
+echo ""
+echo -e "${YELLOW}---------------------------------- INSTALLED -------------------------------${NC}"
+printf "${YELLOW} %-16s${NC}%s\n" "add-mobileportal" "${ADDMOBILEPORTAL_IMAGE}"
+printf "${YELLOW} %-16s${NC}%s\n" "mobileservices"   "${MOBILESERVICES_IMAGE}"
+printf "${YELLOW} %-16s${NC}%s\n" "kafka"            "${KAFKA_PORT:+enabled on ${KAFKA_BROKERS}}${KAFKA_PORT:-disabled}"
+printf "${YELLOW} %-16s${NC}%s\n" "listening"        "http://${MOBILEAPI_BIND_HOST}:${MOBILEAPI_PORT}"
+printf "${YELLOW} %-16s${NC}%s\n" "data"             "${DATA_DIR}"
+printf "${YELLOW} %-16s${NC}%s\n" "config"           "${CONF_DIR}"
+echo -e "${YELLOW}----------------------------------------------------------------------------${NC}"
+
+echo ""
+echo -e "${BLUE}Useful from here:${NC}"
+echo -e "${GREEN}  curl -fsSL ${SETUP_URL} | bash -s -- status${NC}   what is running, and is the gate closed"
+echo -e "${GREEN}  podman logs -f add-mobileportal${NC}"
+echo -e "${GREEN}  ${UNINSTALL_CMD}${NC}"
+
+# ---- Next steps -------------------------------------------------------------
+echo ""
+echo -e "${YELLOW}--------------------------------- NEXT STEPS -------------------------------${NC}"
+echo ""
+echo -e "${BLUE}1. Put nginx in front of this. The pod speaks plain HTTP on ${MOBILEAPI_BIND_HOST} only;${NC}"
+echo -e "${BLUE}   RavenLive and the driver devices are HTTPS-only and cannot reach it as it stands.${NC}"
+if [ "${HOST_NGINX_READY}" -eq 1 ]; then
+  echo ""
+  echo -e "${BLUE}   A vhost for ${GREEN}${SERVER_NAME}${BLUE} on port ${GREEN}${MOBILEAPI_PORT}${BLUE} has been written for you:${NC}"
+  echo -e "${GREEN}     ${CONF_DIR}/${SERVER_NAME}.conf${NC}"
+  echo -e "${GREEN}     ${CONF_DIR}/raven-upgrade.conf${NC}"
+  echo ""
+  echo -e "${BLUE}   Point it at your certificate and install both, or let the script do it:${NC}"
+  echo -e "${GREEN}     sudo ${CONF_DIR}/host-nginx.sh --server-name ${SERVER_NAME} --port ${MOBILEAPI_PORT} \\${NC}"
+  echo -e "${GREEN}          --cert /etc/nginx/ssl/${SERVER_NAME}/fullchain.pem \\${NC}"
+  echo -e "${GREEN}          --key  /etc/nginx/ssl/${SERVER_NAME}/privkey.pem${NC}"
+  echo ""
+  echo -e "${BLUE}   It tests the config before reloading and rolls back if nginx refuses it.${NC}"
+else
+  echo ""
+  echo -e "${BLUE}   Get the generator and run it on the host whenever you want one:${NC}"
+  echo -e "${GREEN}     curl -fsSL ${HOST_NGINX_URL} | sudo bash -s -- \\${NC}"
+  echo -e "${GREEN}          --server-name ${SERVER_NAME:-<your-hostname>} --port ${MOBILEAPI_PORT} \\${NC}"
+  echo -e "${GREEN}          --cert <fullchain.pem> --key <privkey.pem>${NC}"
+  echo ""
+  echo -e "${BLUE}   Add ${GREEN}--print${BLUE} to see the files without writing anything, or write your own${NC}"
+  echo -e "${BLUE}   from the reference vhost in host-nginx.md.${NC}"
+fi
 
 # The gate refuses any request without an X-Raven-Device header, and only checks it
 # against the device ADD Security currently authorizes. A dispatcher running a client
 # older than that change is answered 401 on every request -- which reads as an outage
 # rather than a client that needs updating, so it is called out here.
 echo ""
-echo -e "${ICON_WARN} ${YELLOW} Dispatchers must be on a RavenLive build that sends its device identity.${NC}"
-echo -e "${BLUE} Older clients are refused with 401 ADD_GATEWAY_UNAUTHORIZED on every request.${NC}"
-echo -e "${BLUE} Roll the client out first, then this stack.${NC}"
+echo -e "${BLUE}2. ${YELLOW}Dispatchers must be on a RavenLive build that sends its device identity.${NC}"
+echo -e "${BLUE}   Older clients are refused with 401 ADD_GATEWAY_UNAUTHORIZED on every request.${NC}"
+echo -e "${BLUE}   Roll the client out first, then this stack.${NC}"
 echo ""

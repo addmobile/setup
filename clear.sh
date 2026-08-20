@@ -29,5 +29,12 @@ done
 podman volume rm mongo-configdb 2>/dev/null || true
 
 echo "Removed '${POD_NAME}'."
-echo "Data is kept in ~/ADD_MOBILE/data (mongo, and kafka when it was enabled) and the rendered config in ~/ADD_MOBILE/conf;"
-echo "delete them manually to reclaim the space."
+echo ""
+echo "Data is kept in ~/ADD_MOBILE/data (mongo, and kafka when it was enabled) and the rendered"
+echo "config in ~/ADD_MOBILE/conf. To reclaim the space:"
+echo ""
+echo "  podman unshare rm -rf ~/ADD_MOBILE/data"
+echo "  rm -rf ~/ADD_MOBILE/conf"
+echo ""
+echo "The data directories are owned by a container uid rather than by you, so they need the"
+echo "'podman unshare' form -- a plain rm -rf reports permission denied on them."
