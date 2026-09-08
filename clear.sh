@@ -1,6 +1,20 @@
-#! /bin/bash
+#!/usr/bin/env bash
+
+set -euo pipefail
 
 POD_NAME="mobile-pod"
+
+case "${1:-}" in
+  "") ;;
+  -h|--help)
+    echo "Usage: clear.sh"
+    echo "Removes the mobile-pod and its transient volumes; host data and config are kept."
+    exit 0
+    ;;
+  *) echo "Unknown argument: $1" >&2; exit 2 ;;
+esac
+
+command -v podman >/dev/null 2>&1 || { echo "podman is required" >&2; exit 1; }
 
 if ! podman pod exists "${POD_NAME}"; then
   echo "Pod '${POD_NAME}' does not exist; nothing to remove."
@@ -8,22 +22,18 @@ if ! podman pod exists "${POD_NAME}"; then
 fi
 
 POD_ANON_VOLUMES=()
-for container in kafka mongodb mobileservices add-mobileportal nginx; do
-  if podman container exists "${container}"; then
-    while read -r volume; do
-      [ -n "${volume}" ] && POD_ANON_VOLUMES+=("${volume}")
-    done < <(podman inspect "${container}" \
-      --format '{{range .Mounts}}{{if eq .Type "volume"}}{{.Name}}{{"\n"}}{{end}}{{end}}' 2>/dev/null)
-  fi
-done
+while IFS= read -r container; do
+  [ -n "${container}" ] || continue
+  while IFS= read -r volume; do
+    [[ "${volume}" =~ ^[0-9a-f]{64}$ ]] && POD_ANON_VOLUMES+=("${volume}")
+  done < <(podman inspect "${container}" \
+    --format '{{range .Mounts}}{{if eq .Type "volume"}}{{.Name}}{{"\n"}}{{end}}{{end}}' 2>/dev/null)
+done < <(podman ps -aq --filter "pod=${POD_NAME}")
 
-podman pod stop "${POD_NAME}" 2>/dev/null
-podman pod rm -f "${POD_NAME}"
+podman pod rm --force "${POD_NAME}"
 
 for volume in "${POD_ANON_VOLUMES[@]}"; do
-  if [[ "${volume}" =~ ^[0-9a-f]{64}$ ]]; then
-    podman volume rm "${volume}" >/dev/null 2>&1 || true
-  fi
+  podman volume rm "${volume}" >/dev/null 2>&1 || true
 done
 
 podman volume rm mongo-configdb 2>/dev/null || true
