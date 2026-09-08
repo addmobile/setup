@@ -187,6 +187,7 @@ server {
 
         proxy_set_header   RAVEN-USER      "";
         proxy_set_header   RAVEN-DATABASES "";
+        proxy_set_header   RAVEN-DEVICE    "";
     }
 }
 EOF
@@ -304,7 +305,13 @@ echo -e "${GREEN}   config OK${NC}"
 
 echo -e "${BLUE}Reloading nginx...${NC}"
 if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet nginx; then
-  systemctl reload nginx
+  if ! systemctl reload nginx; then
+    echo -e "${RED}nginx reload failed; restoring the previous files.${NC}" >&2
+    restore
+    nginx -t >/dev/null 2>&1 || true
+    systemctl reload nginx >/dev/null 2>&1 || true
+    exit 1
+  fi
 elif ! nginx -s reload 2>/dev/null; then
   echo -e "${YELLOW}   nginx does not appear to be running; start it with: systemctl start nginx${NC}"
 fi

@@ -13,9 +13,15 @@ case "${REGISTRY}" in
 esac
 PORTAL_REPO="add-mobileportal"
 MOBILESERVICES_REPO="mobileservices"
-SETUP_URL="https://raw.githubusercontent.com/addmobile/setup/refs/heads/main/setup.sh"
-HOST_NGINX_URL="https://raw.githubusercontent.com/addmobile/setup/refs/heads/main/host-nginx.sh"
-UNINSTALL_CMD='bash -c "$(curl -fsSL https://raw.githubusercontent.com/addmobile/setup/refs/heads/main/clear.sh)"'
+SETUP_REF="${SETUP_REF:-main}"
+if ! [[ "${SETUP_REF}" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+  echo "SETUP_REF contains unsupported characters: ${SETUP_REF}" >&2
+  exit 2
+fi
+SETUP_RAW_BASE="https://raw.githubusercontent.com/addmobile/setup/${SETUP_REF}"
+SETUP_URL="${SETUP_RAW_BASE}/setup.sh"
+HOST_NGINX_URL="${SETUP_RAW_BASE}/host-nginx.sh"
+UNINSTALL_CMD="bash -c \"\$(curl -fsSL ${SETUP_RAW_BASE}/clear.sh)\""
 PORTAL_MIN_VERSION="v1.0.0.32"
 
 # Container uids the bind-mounted data directories have to be writable by. mongod is handed
@@ -52,11 +58,11 @@ MONGODB_DIR="${DATA_DIR}/mongo"
 GATEWAY_URL="${GATEWAY_URL:-}"
 SERVER_NAME="${SERVER_NAME:-}"   # public hostname, used to render the host nginx vhost
 
-# ---- Icons ------------------------
-ICON_THUMBSUP="👍"
-ICON_THUMBSDOWN="👎"
-ICON_WARN="⚠️"
-ICON_TIP="😎"
+# ---- Status prefixes --------------------------------------------------------
+ICON_THUMBSUP="[OK]"
+ICON_THUMBSDOWN="[ERROR]"
+ICON_WARN="[WARN]"
+ICON_TIP="[TIP]"
 
 # ---- Colors -----------------------
 RED='\033[0;31m'
@@ -126,7 +132,7 @@ on_failure() {
 wait_for_http() {
   local _ code
   for _ in $(seq 1 "${2:-30}"); do
-    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 "$1" || echo 000)"
+    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 "$1")" || code="000"
     case "${code}" in
       2??) return 0 ;;
     esac
@@ -136,15 +142,15 @@ wait_for_http() {
 }
 
 gate_state() {
-  local url="$1" response code body
-  response="$(curl -s -w '\n%{http_code}' --max-time 5 "${url}" 2>/dev/null || printf '\n000')"
+  local url="$1" method="${2:-GET}" response code body
+  response="$(curl -s -X "${method}" -w '\n%{http_code}' --max-time 5 "${url}" 2>/dev/null)" || response=$'\n000'
   code="${response##*$'\n'}"
   body="${response%$'\n'*}"
 
   case "${code}" in
     401)
       case "${body}" in
-        *ADD_GATEWAY_UNAUTHORIZED*) echo "closed" ;;
+        ADD_GATEWAY_UNAUTHORIZED) echo "closed" ;;
         *)                          echo "closed-unmarked" ;;
       esac
       ;;
@@ -161,8 +167,8 @@ gate_state() {
 }
 
 report_gate() {
-  local label="$1" url="$2" what="$3" state
-  state="$(gate_state "${url}")"
+  local label="$1" url="$2" what="$3" method="${4:-GET}" state
+  state="$(gate_state "${url}" "${method}")"
   case "${state}" in
     closed)
       echo -e "${ICON_THUMBSUP} ${GREEN} ${label} closed (unauthenticated requests refused)${NC}"
@@ -170,6 +176,7 @@ report_gate() {
     closed-unmarked)
       echo -e "${ICON_WARN} ${YELLOW} ${label} refused the request, but not with the gate's own 401.${NC}"
       echo -e "${BLUE} Something in front of nginx may be answering first. Requests are still refused.${NC}"
+      DEGRADED=1
       ;;
     open)
       echo -e "${ICON_THUMBSDOWN} ${RED} THE ${label} IS OPEN -- an unauthenticated request was answered, not refused.${NC}"
@@ -227,6 +234,11 @@ check_endpoints() {
     "The API performs no authentication of its own, so everything behind nginx is open."
   report_gate "socket gate" "${base}/socket.io/?EIO=4&transport=polling" \
     "Live driver positions would be readable without a credential."
+  local update
+  for update in snapshot location window_state; do
+    report_gate "${update} gate" "${base}/devices/gate-probe/${update}" \
+      "Producer updates require an authenticated caller." POST
+  done
 }
 
 status_report() {
@@ -514,7 +526,8 @@ fi
 echo -e "${YELLOW}------------------------------------ ENV -----------------------------------${NC}"
 
 DISCOVERY_URL="${GATEWAY_URL%/}/.well-known/openid-configuration"
-STATUS_CODE="$(curl -s -o /dev/null -w "%{http_code}" "${DISCOVERY_URL}" || echo "000")"
+STATUS_CODE="$(curl -s --connect-timeout 10 --max-time 20 \
+  -o /dev/null -w "%{http_code}" "${DISCOVERY_URL}")" || STATUS_CODE="000"
 
 if [ "$STATUS_CODE" = "200" ]; then
     echo -e "${ICON_THUMBSUP} ${GREEN} Success:${DISCOVERY_URL} returned HTTP 200 ${NC}"
@@ -540,15 +553,14 @@ else
 fi
 
 # ---- Resolve image tags from the registry ------------------------------------
-# Credentials go in through --config on stdin, never on the command line: an argument is
-# visible in `ps` to every user on the box. (podman login already uses --password-stdin.)
+# Credentials go in through --config on stdin, never on the command line.
 registry_tags() {
   local escaped="${USERNAME}:${PASSWORD}" body
   escaped="${escaped//\\/\\\\}"
   escaped="${escaped//\"/\\\"}"
 
   body="$(printf 'user = "%s"\n' "${escaped}" \
-    | curl -fsS --config - "${REGISTRY_URL}/v2/$1/tags/list" 2>/dev/null)" || return 1
+    | curl -fsS --connect-timeout 10 --max-time 30 --config - "${REGISTRY_URL}/v2/$1/tags/list" 2>/dev/null)" || return 1
 
   printf '%s' "${body}" \
     | tr ',' '\n' \
@@ -669,11 +681,25 @@ PULL_IMAGES=("${ADDMOBILEPORTAL_IMAGE}" "${MOBILESERVICES_IMAGE}" "${MONGO_IMAGE
 echo ""
 echo -e "${BLUE}Pulling images...${NC}"
 for image in "${PULL_IMAGES[@]}"; do
-  if podman image exists "${image}"; then
-    echo "Present: ${image}"
+  case "${image}" in
+    *@sha256:*)
+      if podman image exists "${image}"; then
+        echo "Present by digest: ${image}"
+        continue
+      fi
+      ;;
+    localhost/*|localhost:*)
+      if podman image exists "${image}"; then
+        echo "Using local override: ${image}"
+        continue
+      fi
+      ;;
+  esac
+  if [[ "${image}" != */* ]] && podman image exists "${image}"; then
+    echo "Using local override: ${image}"
     continue
   fi
-  echo "Pulling: ${image}"
+  echo "Refreshing: ${image}"
   if ! podman pull "${image}"; then
     echo -e "${ICON_THUMBSDOWN} ${RED} Could not pull ${image}. Nothing was changed.${NC}" >&2
     exit 1
@@ -754,8 +780,8 @@ podman run -d \
   --env KAFKA_LOG_DIRS=/var/lib/kafka/data \
   --env KAFKA_NODE_ID=1 \
   --env KAFKA_PROCESS_ROLES=broker,controller \
-  --env KAFKA_LISTENERS=PLAINTEXT://127.0.0.1:${KAFKA_PORT},CONTROLLER://127.0.0.1:9093 \
-  --env KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://${KAFKA_BROKERS} \
+  --env "KAFKA_LISTENERS=PLAINTEXT://127.0.0.1:${KAFKA_PORT},CONTROLLER://127.0.0.1:9093" \
+  --env "KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://${KAFKA_BROKERS}" \
   --env KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER \
   --env KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT \
   --env KAFKA_CONTROLLER_QUORUM_VOTERS=1@127.0.0.1:9093 \
@@ -914,7 +940,8 @@ fi
 # ---- 9. Render the host nginx vhost -----------------------------------------
 HOST_NGINX_READY=0
 if [ -n "${HOST_NGINX_WANTED}" ]; then
-  if curl -fsSL "${HOST_NGINX_URL}" -o "${CONF_DIR}/host-nginx.sh" 2>/dev/null \
+  if curl -fsSL --connect-timeout 10 --max-time 60 \
+       "${HOST_NGINX_URL}" -o "${CONF_DIR}/host-nginx.sh" 2>/dev/null \
      && [ -s "${CONF_DIR}/host-nginx.sh" ]; then
     chmod 755 "${CONF_DIR}/host-nginx.sh"
     if bash "${CONF_DIR}/host-nginx.sh" --render \
@@ -970,13 +997,3 @@ else
   echo -e "${BLUE}   Add ${GREEN}--print${BLUE} to see the files without writing anything, or write your own${NC}"
   echo -e "${BLUE}   from the reference vhost in host-nginx.md.${NC}"
 fi
-
-# The gate refuses any request without an X-Raven-Device header, and only checks it
-# against the device ADD Security currently authorizes. A dispatcher running a client
-# older than that change is answered 401 on every request -- which reads as an outage
-# rather than a client that needs updating, so it is called out here.
-echo ""
-echo -e "${BLUE}2. ${YELLOW}Dispatchers must be on a RavenLive build that sends its device identity.${NC}"
-echo -e "${BLUE}   Older clients are refused with 401 ADD_GATEWAY_UNAUTHORIZED on every request.${NC}"
-echo -e "${BLUE}   Roll the client out first, then this stack.${NC}"
-echo ""
